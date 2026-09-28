@@ -4,7 +4,7 @@
 #   docker build -f deploy/docker/go.Dockerfile -t audittrail/server .
 # Base images are pinned by digest (THREAT_MODEL T13); Dependabot bumps them.
 
-FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
 WORKDIR /src
 # Cross-compile natively on the build host (no QEMU for multi-arch images).
 ARG TARGETOS=linux TARGETARCH=amd64
