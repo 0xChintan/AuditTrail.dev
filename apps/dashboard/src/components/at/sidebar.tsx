@@ -2,10 +2,10 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BadgeCheckIcon, BuildingIcon, ShieldCheckIcon } from "lucide-react";
+import { BadgeCheckIcon, BuildingIcon, LogOutIcon, ShieldCheckIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-export function Sidebar({ tenants }: { tenants: { id: string; name: string; legal_hold: boolean }[] }) {
+export function Sidebar({ tenants, operator, sso }: { tenants: { id: string; name: string; legal_hold: boolean }[]; operator?: string | null; sso?: boolean }) {
   const path = usePathname();
   const item = (href: string, active: boolean, children: React.ReactNode) => (
     <Link
@@ -47,6 +47,16 @@ export function Sidebar({ tenants }: { tenants: { id: string; name: string; lega
       <p className="mt-auto px-2.5 text-[11px] leading-relaxed text-zinc-500">
         Hash-chained, Ed25519-signed, RFC 3161-anchored audit ledger for AI agents.
       </p>
+      {sso && (
+        <div className="mt-3 border-t border-zinc-800 px-2.5 pt-3">
+          {operator && <p className="truncate text-xs text-zinc-300" title={operator}>{operator}</p>}
+          <form method="post" action="/auth/logout">
+            <button type="submit" className="mt-1.5 flex items-center gap-1.5 text-xs text-zinc-500 transition-colors hover:text-zinc-200">
+              <LogOutIcon className="size-3.5" /> Sign out
+            </button>
+          </form>
+        </div>
+      )}
     </aside>
   );
 }

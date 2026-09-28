@@ -6,7 +6,7 @@ import { v2 } from "@audittrail/core";
 import { AuditTrail, type Metric } from "../src/index.js";
 import { FileSpool } from "../src/node.js";
 
-const KEY = "at2_0123456789ab_" + "A".repeat(43);
+const KEY = "at2_0123456789ab_" + "A".repeat(43); // gitleaks:allow (fake)
 const enc = new TextEncoder();
 
 /** Fake server that verifies signatures like the real one and can be unplugged. */
@@ -103,7 +103,7 @@ describe("SDK v2", () => {
       openai: "sk-proj-" + "b".repeat(40),
       anthropic: "sk-ant-api03-" + "c".repeat(40),
       stripe: "sk_live_" + "d".repeat(24),
-      jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+      jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U", // gitleaks:allow (jwt.io sample)
       pem: "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----",
       audittrail: "at2_0123456789ab_" + "Z".repeat(43),
       password_value: "hunter2-very-secret",

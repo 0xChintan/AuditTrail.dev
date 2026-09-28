@@ -1,0 +1,34 @@
+# AuditTrail TLS edge. Caddy obtains and renews certificates automatically
+# (ACME) and redirects HTTP to HTTPS. For a local or CI run without public
+# DNS, set CADDY_GLOBAL_OPTIONS=local_certs to use Caddy's internal CA.
+{
+	{$CADDY_GLOBAL_OPTIONS}
+	servers {
+		timeouts {
+			read_header 10s
+			idle 2m
+		}
+	}
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+}
+
+{$API_DOMAIN} {
+	import security_headers
+	# Largest legitimate body: OTLP batches (4 MiB, enforced again by the API).
+	request_body {
+		max_size 5MB
+	}
+	reverse_proxy {$API_UPSTREAM:api:8080}
+}
+
+{$DASHBOARD_DOMAIN} {
+	import security_headers
+	reverse_proxy {$DASHBOARD_UPSTREAM:dashboard:3000}
+}

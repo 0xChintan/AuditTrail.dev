@@ -1,0 +1,7 @@
+# Deliberate fake credentials in tests (each line is marked gitleaks:allow).
+# Fingerprints are exact (commit:file:rule:line): any other finding still fails.
+# security_test.go: a malformed all-zero key used to test auth rejection
+cfac8def9bfb458789d94ebcd9ab7454417e3f2c:packages/ingestion-go/internal/api/security_test.go:audittrail-api-key:159
+# sdk-v2.test.ts: a padded fake key, and the public jwt.io sample token planted to prove redaction (C4)
+cfac8def9bfb458789d94ebcd9ab7454417e3f2c:packages/sdk/test/sdk-v2.test.ts:generic-api-key:9
+cfac8def9bfb458789d94ebcd9ab7454417e3f2c:packages/sdk/test/sdk-v2.test.ts:jwt:106

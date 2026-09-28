@@ -1,0 +1,237 @@
+# AuditTrail production stack (single host). See docs/DEPLOYING.md.
+#
+#   cd deploy/compose
+#   ./init-secrets.sh            # CA + Postgres TLS cert, all secrets (once)
+#   cp .env.example .env         # set API_DOMAIN, DASHBOARD_DOMAIN, ACME_EMAIL
+#   docker compose up -d --build --wait
+#
+# Network layout: only Caddy publishes ports (80 -> 443 redirect, HSTS).
+# Postgres and the API sit on internal networks with no route out; Postgres
+# accepts TLS connections only (pg_hba has no plaintext "host" lines) and
+# every client verifies its certificate (sslmode=verify-full).
+
+name: audittrail
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+x-server: &server
+  <<: *hardening
+  image: ${AUDITTRAIL_SERVER_IMAGE:-audittrail/server:local}
+  build:
+    context: ../..
+    dockerfile: deploy/docker/go.Dockerfile
+
+services:
+  postgres:
+    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      POSTGRES_DB: audittrail
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password, pg_server_crt, pg_server_key]
+    # The server key must be owned by postgres with mode 0600; copy it out of
+    # the secrets mount before handing over to the stock entrypoint.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/tls
+        install -o postgres -g postgres -m 0600 /run/secrets/pg_server_key /var/lib/postgresql/tls/server.key
+        install -o postgres -g postgres -m 0644 /run/secrets/pg_server_crt /var/lib/postgresql/tls/server.crt
+        exec docker-entrypoint.sh "$$@"
+      - --
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/var/lib/postgresql/tls/server.crt
+      - -c
+      - ssl_key_file=/var/lib/postgresql/tls/server.key
+      - -c
+      - ssl_min_protocol_version=TLSv1.3
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - password_encryption=scram-sha-256
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    networks: [db]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "audittrail"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    <<: *server
+    entrypoint: ["/usr/local/bin/audittrail-migrate"]
+    restart: "no"
+    environment:
+      DATABASE_ADMIN_URL_FILE: /run/secrets/admin_db_url
+      AUDITTRAIL_APP_DB_PASSWORD_FILE: /run/secrets/app_db_password
+      AUDITTRAIL_WORKER_DB_PASSWORD_FILE: /run/secrets/worker_db_password
+      AUDITTRAIL_PURGE_DB_PASSWORD_FILE: /run/secrets/purge_db_password
+      AUDITTRAIL_CONTROL_DB_PASSWORD_FILE: /run/secrets/control_db_password
+    secrets: [admin_db_url, pg_ca_crt, app_db_password, worker_db_password, purge_db_password, control_db_password]
+    networks: [db]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    <<: *server
+    entrypoint: ["/usr/local/bin/audittrail-api"]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/app_db_url
+      DATABASE_CONTROL_URL_FILE: /run/secrets/control_db_url
+      # Plaintext master key file; compose.kms.yaml replaces it with a KMS-wrapped one.
+      AUDITTRAIL_MASTER_KEY_FILE: /run/secrets/master_key
+      AUDITTRAIL_KEY_PEPPER_FILE: /run/secrets/key_pepper
+      AUDITTRAIL_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      LISTEN_ADDR: ":8080"
+      CORS_ORIGINS: https://${DASHBOARD_DOMAIN:?set DASHBOARD_DOMAIN in .env}
+      DB_MAX_CONNS: ${API_DB_MAX_CONNS:-20}
+    secrets: [app_db_url, control_db_url, pg_ca_crt, master_key, key_pepper, admin_token]
+    networks: [db, edge]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/audittrail-healthcheck", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    <<: *server
+    entrypoint: ["/usr/local/bin/audittrail-worker"]
+    environment:
+      DATABASE_WORKER_URL_FILE: /run/secrets/worker_db_url
+      AUDITTRAIL_MASTER_KEY_FILE: /run/secrets/master_key
+      CHECKPOINT_INTERVAL: ${CHECKPOINT_INTERVAL:-2m}
+      TSA_URL: ${TSA_URL:-https://freetsa.org/tsr}
+      WITNESSES: ${WITNESSES:-}
+    secrets: [worker_db_url, pg_ca_crt, master_key]
+    # egress: the worker calls the RFC 3161 TSA and the witnesses.
+    networks: [db, egress]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  purge:
+    <<: *server
+    entrypoint: ["/usr/local/bin/audittrail-purge"]
+    command: ["-every", "${PURGE_INTERVAL:-6h}"]
+    environment:
+      DATABASE_PURGE_URL_FILE: /run/secrets/purge_db_url
+    secrets: [purge_db_url, pg_ca_crt]
+    networks: [db]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  dashboard:
+    <<: *hardening
+    image: ${AUDITTRAIL_DASHBOARD_IMAGE:-audittrail/dashboard:local}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/dashboard.Dockerfile
+    environment:
+      AUDITTRAIL_API_URL: http://api:8080
+      AUDITTRAIL_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      DASHBOARD_PASSWORD_FILE: /run/secrets/dashboard_password
+    secrets: [admin_token, dashboard_password]
+    tmpfs: ["/tmp", "/app/apps/dashboard/.next/cache:uid=1000,gid=1000"]
+    networks: [edge]
+    depends_on:
+      api: { condition: service_healthy }
+
+  caddy:
+    <<: *hardening
+    image: caddy:2-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
+    cap_add: [NET_BIND_SERVICE]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
+      DASHBOARD_DOMAIN: ${DASHBOARD_DOMAIN:?set DASHBOARD_DOMAIN in .env}
+      CADDY_GLOBAL_OPTIONS: ${CADDY_GLOBAL_OPTIONS:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    tmpfs: ["/tmp"]
+    networks: [edge, egress]
+    depends_on:
+      api: { condition: service_healthy }
+      dashboard: { condition: service_started }
+
+  # DEV/DEMO ONLY: three witnesses on the same host give no independence.
+  # In production, witnesses are run by other parties; list them in WITNESSES.
+  #   docker compose --profile local-witnesses up -d
+  #   WITNESSES=w1=http://witness1:7101,w2=http://witness2:7101,w3=http://witness3:7101
+  witness1: &witness
+    <<: *server
+    profiles: [local-witnesses]
+    entrypoint: ["/usr/local/bin/audittrail-witness"]
+    command: ["-name", "witness.audittrail.local/w1", "-key", "/var/lib/audittrail/seed", "-state", "/var/lib/audittrail/state.json", "-listen", ":7101", "-tofu", "http://api:8080"]
+    volumes: ["witness1:/var/lib/audittrail"]
+    networks: [edge, egress]
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/audittrail-healthcheck", "http://127.0.0.1:7101/vkey"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+  witness2:
+    <<: *witness
+    command: ["-name", "witness.audittrail.local/w2", "-key", "/var/lib/audittrail/seed", "-state", "/var/lib/audittrail/state.json", "-listen", ":7101", "-tofu", "http://api:8080"]
+    volumes: ["witness2:/var/lib/audittrail"]
+  witness3:
+    <<: *witness
+    command: ["-name", "witness.audittrail.local/w3", "-key", "/var/lib/audittrail/seed", "-state", "/var/lib/audittrail/state.json", "-listen", ":7101", "-tofu", "http://api:8080"]
+    volumes: ["witness3:/var/lib/audittrail"]
+
+networks:
+  db: { internal: true }      # Postgres + the services that talk to it; no route out
+  edge: { internal: true }    # Caddy <-> API / dashboard; no route out
+  egress: {}                  # published ports (Caddy) and outbound calls (worker)
+
+volumes:
+  pgdata: {}
+  caddy_data: {}
+  caddy_config: {}
+  witness1: {}
+  witness2: {}
+  witness3: {}
+
+# Created by ./init-secrets.sh. Files are mode 0644 inside a 0700 directory:
+# compose bind-mounts each file, and the services run as non-root users.
+secrets:
+  pg_ca_crt: { file: ./secrets/ca.crt }
+  pg_server_crt: { file: ./secrets/postgres.crt }
+  pg_server_key: { file: ./secrets/postgres.key }
+  postgres_password: { file: ./secrets/postgres_password }
+  admin_db_url: { file: ./secrets/admin_db_url }
+  app_db_url: { file: ./secrets/app_db_url }
+  worker_db_url: { file: ./secrets/worker_db_url }
+  control_db_url: { file: ./secrets/control_db_url }
+  purge_db_url: { file: ./secrets/purge_db_url }
+  app_db_password: { file: ./secrets/app_db_password }
+  worker_db_password: { file: ./secrets/worker_db_password }
+  control_db_password: { file: ./secrets/control_db_password }
+  purge_db_password: { file: ./secrets/purge_db_password }
+  master_key: { file: ./secrets/master_key }
+  key_pepper: { file: ./secrets/key_pepper }
+  admin_token: { file: ./secrets/admin_token }
+  dashboard_password: { file: ./secrets/dashboard_password }

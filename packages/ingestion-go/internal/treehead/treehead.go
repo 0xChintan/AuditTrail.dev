@@ -104,15 +104,18 @@ func (w *Worker) Run(ctx context.Context, tenantID string) (*Head, error) {
 	err := pgx.BeginFunc(ctx, w.Pool, func(tx pgx.Tx) error {
 		var locked bool
 		if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtext('audittrail.treehead:' || $1::text))`, tenantID).Scan(&locked); err != nil || !locked {
-			return err
+			if err != nil {
+				return fmt.Errorf("tree head lock: %w", err)
+			}
+			return nil
 		}
 		var last int64
 		if err := tx.QueryRow(ctx, `SELECT COALESCE(max(tree_size),0) FROM tree_heads WHERE tenant_id=$1`, tenantID).Scan(&last); err != nil {
-			return err
+			return fmt.Errorf("latest tree head: %w", err)
 		}
 		var n int64
 		if err := tx.QueryRow(ctx, `SELECT last_seq FROM chain_state WHERE tenant_id=$1`, tenantID).Scan(&n); err != nil {
-			return err
+			return fmt.Errorf("chain state: %w", err)
 		}
 		if n == 0 {
 			return nil
@@ -123,7 +126,10 @@ func (w *Worker) Run(ctx context.Context, tenantID string) (*Head, error) {
 		}
 		size = uint64(n) // #nosec G115 -- positive
 		if n == last {
-			return tx.QueryRow(ctx, `SELECT id, note FROM tree_heads WHERE tenant_id=$1 AND tree_size=$2`, tenantID, n).Scan(&headID, &note)
+			if err := tx.QueryRow(ctx, `SELECT id, note FROM tree_heads WHERE tenant_id=$1 AND tree_size=$2`, tenantID, n).Scan(&headID, &note); err != nil {
+				return fmt.Errorf("current tree head: %w", err)
+			}
+			return nil
 		}
 		// Re-verify every row added since the last head before signing.
 		if err := verifyRange(ctx, tx, tenantID, last+1, n, leaves); err != nil {
@@ -140,9 +146,12 @@ func (w *Worker) Run(ctx context.Context, tenantID string) (*Head, error) {
 		}
 		cp := tlog.Checkpoint{Origin: tlog.Origin(tenantID), Size: size, Root: root}
 		note = string(tlog.SignCheckpoint(cp, tlog.Signer{Name: cp.Origin, Priv: priv}))
-		return tx.QueryRow(ctx, `INSERT INTO tree_heads (tenant_id, tree_size, root_hash, head_hash, note, key_id, tsa_status)
+		if err := tx.QueryRow(ctx, `INSERT INTO tree_heads (tenant_id, tree_size, root_hash, head_hash, note, key_id, tsa_status)
 			VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`, tenantID, n, hex.EncodeToString(root), hex.EncodeToString(leaves[n-1]),
-			note, keyID, map[bool]string{true: "pending", false: "disabled"}[w.TSA != nil]).Scan(&headID)
+			note, keyID, map[bool]string{true: "pending", false: "disabled"}[w.TSA != nil]).Scan(&headID); err != nil {
+			return fmt.Errorf("insert tree head: %w", err)
+		}
+		return nil
 	})
 	if err != nil || headID == "" {
 		return nil, err

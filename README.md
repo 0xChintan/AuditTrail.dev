@@ -32,7 +32,8 @@ AuditTrail records every action, including every tool call an MCP agent makes, i
 | `packages/mcp-sidecar` | `audittrail-mcp-proxy`: MCP audit sidecar (stdio and Streamable HTTP), tool pinning, heartbeats |
 | `apps/dashboard` | Next.js dashboard (strict CSP, password-protected): onboarding, keys, activity timeline, tree heads, exports, retention/legal hold, in-browser verification |
 | `schemas/` | `v2/SPEC.md` (the exact bytes that are hashed and signed), 318 cross-language test vectors, pinned TSA roots |
-| `docs/` | Quickstart, ASVS L2 self-assessment, performance, releasing, validation kit, testing backlog, launch post draft |
+| `deploy/` | Container images and the production compose stack (TLS edge, TLS-only Postgres, KMS and SSO overlays) |
+| `docs/` | Quickstart, deploying, ASVS L2 self-assessment, performance, releasing, validation kit, testing backlog, launch post draft |
 
 ## Quickstart (local)
 
@@ -58,9 +59,12 @@ Then follow **[docs/QUICKSTART.md](docs/QUICKSTART.md)**: onboard a tenant, wrap
 | Tampered bundles fail with a named invariant (A1–A7) | `go test ./packages/ingestion-go/internal/verify2` |
 | Stored XSS payloads render inert under the CSP | `node scripts/xss-corpus.mjs` |
 | Load: 4,783 req/s, p99 24.8 ms; Postgres restart loses nothing | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) |
+| Rate limits hold across API instances (119 of 120 allowed) | `go test ./packages/ingestion-go/internal/api -run RateLimit` |
+| Dashboard SSO: allowlist, MFA, CSRF, tampered cookies, operator attribution (23 checks, real OpenID provider) | `node scripts/oidc-e2e.mjs` |
+| Production stack through the TLS edge: TLS-only Postgres, signed ingest, witnessed tree head, offline verify | `deploy/compose/smoke.sh` (CI: `deploy-smoke.yml`) |
 
 Security: [THREAT_MODEL.md](THREAT_MODEL.md), [SECURITY.md](SECURITY.md), [docs/ASVS-L2.md](docs/ASVS-L2.md), [SECRETS.md](SECRETS.md). Build log: [PROGRESS.md](PROGRESS.md).
 
 ## Scope notes
 
-Not yet done: KMS for the master key (it currently lives in `.env`), operator SSO/MFA, a shared rate limiter for multi-instance deployments, per-region data residency, and independent third-party witnesses. The open items are listed in [docs/ASVS-L2.md](docs/ASVS-L2.md).
+Production deployment: [docs/DEPLOYING.md](docs/DEPLOYING.md). It covers the TLS edge, TLS-only Postgres, the master key in a KMS, operator SSO and shared rate limits. Not yet done: per-region data residency, independent third-party witnesses, and the external penetration test ([docs/ASVS-L2.md](docs/ASVS-L2.md)).

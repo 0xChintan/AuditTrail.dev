@@ -16,6 +16,7 @@ import (
 	"audittrail.dev/packages/ingestion-go/internal/config"
 	"audittrail.dev/packages/ingestion-go/internal/db"
 	"audittrail.dev/packages/ingestion-go/internal/keys"
+	"audittrail.dev/packages/ingestion-go/internal/masterkey"
 )
 
 func main() {
@@ -26,11 +27,12 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	master, err := keys.ParseMasterKey(os.Getenv("AUDITTRAIL_MASTER_KEY"))
+	master, src, err := masterkey.Load(context.Background())
 	if err != nil {
-		log.Error("config", "err", err)
+		log.Error("master key", "err", err)
 		os.Exit(1)
 	}
+	log.Info("master key loaded", "source", src)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -61,6 +63,9 @@ func main() {
 		}
 	}
 	srv := api.New(pool, control, master, pepper, os.Getenv("AUDITTRAIL_ADMIN_TOKEN"), cors, log)
+	if config.Str("RATE_LIMIT_MODE", "shared") == "local" {
+		srv.Rate = nil // per-instance token buckets (single-instance deployments)
+	}
 	if n := config.Int("SEQUENCER_MAX_BATCH", 256); n > 0 {
 		srv.Seq.MaxBatch = n
 	}

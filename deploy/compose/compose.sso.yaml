@@ -1,0 +1,32 @@
+# Operator sign-in through your identity provider (OIDC) instead of the
+# shared dashboard password. Admin actions are then sealed into each
+# tenant's ledger under the operator's own email.
+#
+#   Register a confidential "web" client at your IdP with redirect URI
+#     https://$DASHBOARD_DOMAIN/auth/callback
+#   and post-logout redirect URI https://$DASHBOARD_DOMAIN/
+#   printf '%s' "<client secret>" > secrets/oidc_client_secret
+#   In .env: OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_ALLOWED_DOMAINS and/or OIDC_ALLOWED_EMAILS
+#   docker compose -f compose.yaml -f compose.sso.yaml up -d --wait
+#
+# Combine with compose.kms.yaml as needed: -f compose.yaml -f compose.kms.yaml -f compose.sso.yaml
+services:
+  dashboard:
+    environment:
+      OIDC_ISSUER: ${OIDC_ISSUER:?set OIDC_ISSUER in .env}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?set OIDC_CLIENT_ID in .env}
+      OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+      SESSION_SECRET_FILE: /run/secrets/session_secret
+      DASHBOARD_URL: https://${DASHBOARD_DOMAIN}
+      OIDC_ALLOWED_EMAILS: ${OIDC_ALLOWED_EMAILS:-}
+      OIDC_ALLOWED_DOMAINS: ${OIDC_ALLOWED_DOMAINS:-}
+      OIDC_REQUIRE_MFA: ${OIDC_REQUIRE_MFA:-false}
+      OIDC_TRUST_UNVERIFIED_EMAIL: ${OIDC_TRUST_UNVERIFIED_EMAIL:-false}
+      DASHBOARD_PASSWORD_FILE: ""          # SSO replaces the shared password
+    secrets: !override [admin_token, oidc_client_secret, session_secret]
+    # Discovery, token and UserInfo calls go to the IdP.
+    networks: [edge, egress]
+
+secrets:
+  oidc_client_secret: { file: ./secrets/oidc_client_secret }
+  session_secret: { file: ./secrets/session_secret }

@@ -1,6 +1,8 @@
 // Command audittrail-admin: operator utilities.
 //
 //	audittrail-admin gen-master-key
+//	audittrail-admin kms-wrap -key awskms://alias/audittrail?region=… [-generate]
+//	audittrail-admin kms-rewrap -to gcpkms://projects/…/cryptoKeys/new
 //	audittrail-admin create-tenant -name "Acme" [-retention-days 365]
 //	audittrail-admin list-tenants
 package main
@@ -17,12 +19,13 @@ import (
 	"audittrail.dev/packages/ingestion-go/internal/contract"
 	"audittrail.dev/packages/ingestion-go/internal/db"
 	"audittrail.dev/packages/ingestion-go/internal/keys"
+	"audittrail.dev/packages/ingestion-go/internal/masterkey"
 	"audittrail.dev/packages/ingestion-go/internal/sequencer"
 	"audittrail.dev/packages/ingestion-go/internal/tenant"
 )
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: audittrail-admin gen-master-key | create-tenant -name NAME [-retention-days N] | list-tenants")
+	fmt.Fprintln(os.Stderr, "usage: audittrail-admin gen-master-key | kms-wrap -key URL [-generate] | kms-rewrap -to URL | create-tenant -name NAME [-retention-days N] | list-tenants")
 	os.Exit(2)
 }
 
@@ -37,11 +40,44 @@ func main() {
 	switch os.Args[1] {
 	case "gen-master-key":
 		fmt.Println(keys.GenerateMasterKey())
+	case "kms-wrap":
+		// Prints AUDITTRAIL_MASTER_KEY_WRAPPED. With -generate the new key is
+		// never shown in plaintext; otherwise AUDITTRAIL_MASTER_KEY is wrapped.
+		fs := flag.NewFlagSet("kms-wrap", flag.ExitOnError)
+		keyURL := fs.String("key", os.Getenv(masterkey.EnvKMSKey), "KMS key URL")
+		gen := fs.Bool("generate", false, "generate a new master key instead of wrapping AUDITTRAIL_MASTER_KEY")
+		check(fs.Parse(os.Args[2:]))
+		plain := os.Getenv(masterkey.EnvPlain)
+		if *gen {
+			plain = keys.GenerateMasterKey()
+		}
+		wrapped, err := masterkey.Wrap(ctx, *keyURL, plain)
+		check(err)
+		fmt.Println(wrapped)
+		fmt.Fprintf(os.Stderr, "Deploy this as %s with %s=%s, then remove %s everywhere.\n", masterkey.EnvWrapped, masterkey.EnvKMSKey, *keyURL, masterkey.EnvPlain)
+	case "kms-rewrap":
+		// Moves to a new KMS key: unwraps with the current configuration and
+		// wraps the same master key under -to. No data is re-encrypted.
+		fs := flag.NewFlagSet("kms-rewrap", flag.ExitOnError)
+		to := fs.String("to", "", "new KMS key URL")
+		check(fs.Parse(os.Args[2:]))
+		if *to == "" {
+			usage()
+		}
+		cur := os.Getenv(masterkey.EnvPlain)
+		if u := os.Getenv(masterkey.EnvKMSKey); u != "" {
+			var err error
+			cur, err = masterkey.Unwrap(ctx, u, os.Getenv(masterkey.EnvWrapped))
+			check(err)
+		}
+		wrapped, err := masterkey.Wrap(ctx, *to, cur)
+		check(err)
+		fmt.Println(wrapped)
 	case "create-tenant":
 		fs := flag.NewFlagSet("create-tenant", flag.ExitOnError)
 		name := fs.String("name", "", "tenant name")
 		ret := fs.Int("retention-days", 183, "retention window in days (>=183)")
-		fs.Parse(os.Args[2:])
+		check(fs.Parse(os.Args[2:]))
 		if *name == "" {
 			usage()
 		}
@@ -69,7 +105,7 @@ func main() {
 }
 
 func store(ctx context.Context) *tenant.Store {
-	m, err := keys.ParseMasterKey(os.Getenv("AUDITTRAIL_MASTER_KEY"))
+	m, _, err := masterkey.Load(ctx)
 	check(err)
 	pepper, err := keys.ParsePepper(os.Getenv("AUDITTRAIL_KEY_PEPPER"))
 	check(err)

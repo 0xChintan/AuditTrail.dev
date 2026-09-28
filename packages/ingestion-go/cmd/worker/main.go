@@ -19,7 +19,7 @@ import (
 	"audittrail.dev/packages/ingestion-go/internal/checkpoint"
 	"audittrail.dev/packages/ingestion-go/internal/config"
 	"audittrail.dev/packages/ingestion-go/internal/db"
-	"audittrail.dev/packages/ingestion-go/internal/keys"
+	"audittrail.dev/packages/ingestion-go/internal/masterkey"
 	"audittrail.dev/packages/ingestion-go/internal/treehead"
 )
 
@@ -29,11 +29,12 @@ func main() {
 	flag.Parse()
 	config.LoadDotEnv()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	master, err := keys.ParseMasterKey(os.Getenv("AUDITTRAIL_MASTER_KEY"))
+	master, src, err := masterkey.Load(context.Background())
 	if err != nil {
-		log.Error("config", "err", err)
+		log.Error("master key", "err", err)
 		os.Exit(1)
 	}
+	log.Info("master key loaded", "source", src)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	pool, err := db.Connect(ctx, config.WorkerDBURL(), 4)

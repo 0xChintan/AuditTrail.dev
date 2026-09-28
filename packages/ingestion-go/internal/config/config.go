@@ -5,6 +5,7 @@ package config
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,9 +14,41 @@ import (
 )
 
 // LoadDotEnv sets variables from the nearest .env without overriding ones
-// already present in the environment.
+// already present in the environment, then resolves *_FILE variables.
 func LoadDotEnv() {
+	loadDotEnv()
+	resolveFiles()
+}
+
+// resolveFiles implements the Docker/Kubernetes secrets convention: when X
+// is unset and X_FILE names a file, X is set to that file's contents (one
+// trailing newline trimmed). Secrets then never appear in the process
+// environment of the container spec or in `docker inspect`.
+func resolveFiles() {
+	for _, kv := range os.Environ() {
+		k, path, _ := strings.Cut(kv, "=")
+		name, ok := strings.CutSuffix(k, "_FILE")
+		if !ok || name == "" || path == "" {
+			continue
+		}
+		if v, set := os.LookupEnv(name); set && v != "" {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Clean(path))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "config: %s: %v\n", k, err)
+			os.Exit(2)
+		}
+		os.Setenv(name, strings.TrimSuffix(strings.TrimSuffix(string(b), "\n"), "\r"))
+	}
+}
+
+func loadDotEnv() {
 	dir, _ := os.Getwd()
+	loadDotEnvFrom(dir)
+}
+
+func loadDotEnvFrom(dir string) {
 	for {
 		p := filepath.Join(dir, ".env")
 		if f, err := os.Open(p); err == nil {
@@ -31,7 +64,11 @@ func LoadDotEnv() {
 				}
 				k = strings.TrimSpace(strings.TrimPrefix(k, "export "))
 				v = strings.Trim(strings.TrimSpace(v), `"'`)
-				if _, exists := os.LookupEnv(k); !exists {
+				// The process environment wins, including X_FILE: a secret
+				// file given explicitly must not lose to a .env default.
+				_, exists := os.LookupEnv(k)
+				_, fromFile := os.LookupEnv(k + "_FILE")
+				if !exists && !fromFile {
 					os.Setenv(k, v)
 				}
 			}

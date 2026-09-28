@@ -29,6 +29,7 @@ type Client struct {
 
 type Response struct {
 	Status  int
+	Header  http.Header
 	Body    []byte
 	Receipt map[string]any
 }
@@ -130,7 +131,7 @@ func (c *Client) PostOnce(ctx context.Context, path string, body []byte) (Respon
 	}
 	defer res.Body.Close()
 	data, _ := io.ReadAll(res.Body)
-	out := Response{Status: res.StatusCode, Body: data}
+	out := Response{Status: res.StatusCode, Header: res.Header, Body: data}
 	_ = json.Unmarshal(data, &out.Receipt)
 	return out, nil
 }

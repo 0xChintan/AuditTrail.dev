@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"audittrail.dev/packages/ingestion-go/internal/keys"
 	"audittrail.dev/packages/ingestion-go/internal/ledger"
 	"audittrail.dev/packages/ingestion-go/internal/pii"
+	"audittrail.dev/packages/ingestion-go/internal/ratelimit"
 	"audittrail.dev/packages/ingestion-go/internal/sequencer"
 	"audittrail.dev/packages/ingestion-go/internal/tenant"
 )
@@ -40,6 +42,9 @@ type Server struct {
 	Log         *slog.Logger
 	Now         func() time.Time
 
+	// Rate limits: shared across instances through Postgres (default), or
+	// per instance when Rate is nil (RATE_LIMIT_MODE=local).
+	Rate     *ratelimit.Shared
 	limMu    sync.Mutex
 	limiters map[string]*rate.Limiter
 
@@ -61,6 +66,9 @@ func New(pool, control *pgxpool.Pool, master *keys.MasterKey, pepper keys.Pepper
 		mux:         http.NewServeMux(),
 	}
 	s.Seq.PII = s.PII
+	if control != nil {
+		s.Rate = &ratelimit.Shared{Pool: control, Log: log}
+	}
 	s.routes()
 	return s
 }
@@ -112,7 +120,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if origin := r.Header.Get("Origin"); origin != "" && s.corsAllowed(origin) {
 		h.Set("Access-Control-Allow-Origin", origin)
 		h.Set("Vary", "Origin")
-		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-AuditTrail-Tenant, X-AT-Timestamp, X-AT-Nonce, X-AT-Signature")
+		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-AuditTrail-Tenant, X-AuditTrail-Operator, X-AT-Timestamp, X-AT-Nonce, X-AT-Signature")
 		h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(204)
@@ -178,6 +186,10 @@ func (s *Server) auth(scope string, signed bool, next authed) http.Handler {
 		a := &Auth{}
 		var tenantID string
 		if s.isAdmin(r) && !signed {
+			if op := operatorFrom(r); op != "" {
+				ctx = context.WithValue(ctx, operatorKey{}, op)
+				r = r.WithContext(ctx)
+			}
 			tenantID = r.Header.Get("X-AuditTrail-Tenant")
 			if !isUUID(tenantID) {
 				writeErr(w, 400, "tenant_required", "admin requests to tenant routes need X-AuditTrail-Tenant")
@@ -251,6 +263,9 @@ func (s *Server) adminAuth(next http.Handler) http.Handler {
 			s.unauthorized(w, "admin_token")
 			return
 		}
+		if op := operatorFrom(r); op != "" {
+			r = r.WithContext(context.WithValue(r.Context(), operatorKey{}, op))
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -278,7 +293,15 @@ func (s *Server) StartNonceJanitor(ctx context.Context) {
 
 // ---- rate limiting: per-tenant token bucket --------------------------------------
 
-func (s *Server) limited(w http.ResponseWriter, t tenant.Tenant) bool {
+func (s *Server) limited(w http.ResponseWriter, r *http.Request, t tenant.Tenant) bool {
+	if s.Rate != nil {
+		ok, wait := s.Rate.Allow(r.Context(), t.ID, t.RateLimitRPS, t.RateLimitBurst)
+		if !ok {
+			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(wait.Seconds()))))
+			writeErr(w, 429, "rate_limited", "tenant rate limit exceeded")
+		}
+		return !ok
+	}
 	s.limMu.Lock()
 	l, ok := s.limiters[t.ID]
 	if !ok {
@@ -337,7 +360,7 @@ func (s *Server) internal(w http.ResponseWriter, err error) {
 // ---- v2 ingest ---------------------------------------------------------------------
 
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request, a *Auth) {
-	if s.limited(w, a.Tenant) {
+	if s.limited(w, r, a.Tenant) {
 		return
 	}
 	env, cerr := contract.ValidateEnvelope(a.Body)
@@ -516,8 +539,36 @@ func (s *Server) handlePublicKeys(w http.ResponseWriter, r *http.Request) {
 
 var adminPrincipal = contract.MustFromGo(map[string]string{"id": "admin-token", "type": "service"})
 
+type operatorKey struct{}
+
+// operatorFrom returns the operator asserted by an admin-token caller (the
+// dashboard, after SSO) in X-AuditTrail-Operator, or "" if absent/invalid.
+func operatorFrom(r *http.Request) string {
+	op := strings.TrimSpace(r.Header.Get("X-AuditTrail-Operator"))
+	if op == "" || len(op) > 254 {
+		return ""
+	}
+	for _, c := range op {
+		if c < 0x21 || c > 0x7e { // printable ASCII, no spaces or controls
+			return ""
+		}
+	}
+	return op
+}
+
+// adminEvent seals an admin action into the tenant's own ledger. When the
+// dashboard names the signed-in operator, that person is the principal; the
+// admin token that vouched for them is recorded alongside.
 func (s *Server) adminEvent(ctx context.Context, tenantID, action, target string, meta map[string]any) {
-	s.Record(ctx, tenantID, "audittrail-admin", action, target, "allowed", adminPrincipal, meta)
+	principal := adminPrincipal
+	if op, _ := ctx.Value(operatorKey{}).(string); op != "" {
+		principal = contract.MustFromGo(map[string]string{"id": op, "type": "human"})
+		if meta == nil {
+			meta = map[string]any{}
+		}
+		meta["operator_asserted_by"] = "admin-token"
+	}
+	s.Record(ctx, tenantID, "audittrail-admin", action, target, "allowed", principal, meta)
 }
 
 func (s *Server) handleListTenants(w http.ResponseWriter, r *http.Request) {

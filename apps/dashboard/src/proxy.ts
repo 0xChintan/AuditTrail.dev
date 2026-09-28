@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { authConfig, readSession, sessionCookieName, type AuthConfig } from "@/lib/auth";
 
 /**
  * Every page gets a strict, per-request nonce-based CSP (v2 task 6.1, T12)
@@ -6,32 +7,63 @@ import { NextResponse, type NextRequest } from "next/server";
  * output), so even if an escaping bug slipped in, injected script could not
  * run.
  *
- * Optional password gate (DASHBOARD_PASSWORD, HTTP basic auth). /verify
- * stays public: verifying evidence must not require an account.
+ * Operator sign-in: OIDC SSO when OIDC_ISSUER is set (lib/auth.ts), else
+ * the DASHBOARD_PASSWORD basic-auth gate. /verify stays public: verifying
+ * evidence must not require an account.
  */
-export function proxy(req: NextRequest) {
+export async function proxy(req: NextRequest) {
   const path = req.nextUrl.pathname;
-  const pw = process.env.DASHBOARD_PASSWORD;
-  const publicPath = path.startsWith("/verify") || path.startsWith("/api/pubkeys") || path.startsWith("/verifier/");
-  // Secure by default (ASVS V2/V4): a production dashboard with no password
-  // configured refuses to serve admin pages unless explicitly opted out.
-  const openAllowed = process.env.NODE_ENV !== "production" || process.env.DASHBOARD_ALLOW_NO_AUTH === "true";
-  if (!publicPath && !pw && !openAllowed) {
-    return new NextResponse("Dashboard authentication is not configured: set DASHBOARD_PASSWORD (or DASHBOARD_ALLOW_NO_AUTH=true for local use).", { status: 503 });
+  const publicPath = path.startsWith("/verify") || path.startsWith("/api/pubkeys") || path.startsWith("/verifier/") || path.startsWith("/auth/");
+  let sso: AuthConfig | null;
+  try {
+    sso = authConfig();
+  } catch (e) {
+    return new NextResponse(`Dashboard SSO is misconfigured: ${(e as Error).message}`, { status: 503 });
   }
-  if (pw && !publicPath) {
-    const auth = req.headers.get("authorization") ?? "";
-    let ok = false;
-    if (auth.startsWith("Basic ")) {
-      let decoded = "";
-      try {
-        decoded = atob(auth.slice(6));
-      } catch {
-        decoded = "";
-      }
-      ok = constantTimeEqual(decoded.slice(decoded.indexOf(":") + 1), pw);
+  const requestHeaders = new Headers(req.headers);
+  // Set only below, after verifying the caller; never trusted from the client.
+  requestHeaders.delete("x-at-operator");
+  requestHeaders.delete("x-at-authed");
+
+  // CSRF: state-changing requests must come from the dashboard's own origin.
+  if (!["GET", "HEAD", "OPTIONS"].includes(req.method) && !sameOrigin(req, sso)) {
+    return new NextResponse("Cross-origin request refused", { status: 403 });
+  }
+
+  if (sso) {
+    const session = await readSession(sso, req.cookies.get(sessionCookieName(sso))?.value);
+    if (session) {
+      requestHeaders.set("x-at-operator", session.email);
+      requestHeaders.set("x-at-authed", "1");
+    } else if (!publicPath) {
+      if (path.startsWith("/api/")) return NextResponse.json({ error: { message: "sign-in required" } }, { status: 401 });
+      const login = new URL("/auth/login", sso.baseUrl);
+      login.searchParams.set("next", path + req.nextUrl.search);
+      return NextResponse.redirect(login, 302);
     }
-    if (!ok) return new NextResponse("Authentication required", { status: 401, headers: { "WWW-Authenticate": 'Basic realm="AuditTrail dashboard"' } });
+  } else {
+    const pw = process.env.DASHBOARD_PASSWORD;
+    // Secure by default (ASVS V2/V4): a production dashboard with no sign-in
+    // configured refuses to serve admin pages unless explicitly opted out.
+    const openAllowed = process.env.NODE_ENV !== "production" || process.env.DASHBOARD_ALLOW_NO_AUTH === "true";
+    if (!publicPath && !pw && !openAllowed) {
+      return new NextResponse("Dashboard authentication is not configured: set OIDC_ISSUER (SSO) or DASHBOARD_PASSWORD (or DASHBOARD_ALLOW_NO_AUTH=true for local use).", { status: 503 });
+    }
+    let ok = !pw && openAllowed; // local development without a password
+    if (pw) {
+      const auth = req.headers.get("authorization") ?? "";
+      if (auth.startsWith("Basic ")) {
+        let decoded = "";
+        try {
+          decoded = atob(auth.slice(6));
+        } catch {
+          decoded = "";
+        }
+        ok = constantTimeEqual(decoded.slice(decoded.indexOf(":") + 1), pw);
+      }
+    }
+    if (ok) requestHeaders.set("x-at-authed", "1");
+    else if (!publicPath) return new NextResponse("Authentication required", { status: 401, headers: { "WWW-Authenticate": 'Basic realm="AuditTrail dashboard"' } });
   }
 
   const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
@@ -53,7 +85,6 @@ export function proxy(req: NextRequest) {
     ...(dev ? [] : ["upgrade-insecure-requests"]),
   ].join("; ");
 
-  const requestHeaders = new Headers(req.headers);
   requestHeaders.set("x-nonce", nonce);
   requestHeaders.set("Content-Security-Policy", csp);
   const res = NextResponse.next({ request: { headers: requestHeaders } });
@@ -69,6 +100,20 @@ export function proxy(req: NextRequest) {
 export const config = {
   matcher: [{ source: "/((?!_next/static|_next/image|favicon.ico).*)", missing: [{ type: "header", key: "next-router-prefetch" }] }],
 };
+
+/** The Origin must be the dashboard's public origin (SSO) or match the Host it was served on. */
+function sameOrigin(req: NextRequest, sso: AuthConfig | null): boolean {
+  const origin = req.headers.get("origin");
+  if (!origin || origin === "null") return false;
+  if (sso) return origin === sso.baseUrl.origin;
+  try {
+    // Behind a TLS proxy the scheme differs internally; compare hosts, as Next.js does for server actions.
+    const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host");
+    return new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+}
 
 function constantTimeEqual(a: string, b: string): boolean {
   const ea = new TextEncoder().encode(a);

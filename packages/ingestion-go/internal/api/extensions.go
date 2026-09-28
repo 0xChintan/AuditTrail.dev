@@ -385,7 +385,7 @@ func (s *Server) handleTreeHeads(w http.ResponseWriter, r *http.Request, a *Auth
 }
 
 func (s *Server) handleOTLP(w http.ResponseWriter, r *http.Request, a *Auth) {
-	if s.limited(w, a.Tenant) {
+	if s.limited(w, r, a.Tenant) {
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20+1))

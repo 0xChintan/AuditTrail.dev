@@ -1,0 +1,32 @@
+# Master key in a KMS. Deploy only the wrapped key; the api and worker unwrap
+# it at startup and refuse a plaintext key (AUDITTRAIL_REQUIRE_KMS).
+#
+#   URL='awskms://alias/audittrail?region=eu-central-1'
+#   echo "AUDITTRAIL_KMS_KEY_URL=$URL" >> .env
+#   # wrap the current key (the worker has egress and the plaintext key file):
+#   docker compose run --rm -T --no-deps --entrypoint audittrail-admin worker \
+#     kms-wrap -key "$URL" > secrets/master_key_wrapped
+#   docker compose -f compose.yaml -f compose.kms.yaml up -d --wait
+#   shred -u secrets/master_key        # after confirming the stack is healthy
+#
+# KMS credentials come from the platform (instance role, workload identity) or
+# the provider's standard variables (AWS_*, GOOGLE_APPLICATION_CREDENTIALS,
+# AZURE_*, VAULT_ADDR/VAULT_TOKEN) added to the environment below.
+x-kms-env: &kms-env
+  AUDITTRAIL_MASTER_KEY_FILE: ""
+  AUDITTRAIL_MASTER_KEY_WRAPPED_FILE: /run/secrets/master_key_wrapped
+  AUDITTRAIL_KMS_KEY_URL: ${AUDITTRAIL_KMS_KEY_URL:?set AUDITTRAIL_KMS_KEY_URL in .env}
+  AUDITTRAIL_REQUIRE_KMS: "true"
+
+services:
+  api:
+    environment: *kms-env
+    secrets: !override [app_db_url, control_db_url, pg_ca_crt, master_key_wrapped, key_pepper, admin_token]
+    # The API unwraps the key at startup, so it needs a route to the KMS.
+    networks: [db, edge, egress]
+  worker:
+    environment: *kms-env
+    secrets: !override [worker_db_url, pg_ca_crt, master_key_wrapped]
+
+secrets:
+  master_key_wrapped: { file: ./secrets/master_key_wrapped }

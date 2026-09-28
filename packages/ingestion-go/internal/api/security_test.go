@@ -156,7 +156,7 @@ func TestS1BadSignature(t *testing.T) {
 		},
 		"path changed after signing": func(r *http.Request) { r.URL.Path = "/v2/events/" },
 		"garbage key": func(r *http.Request) {
-			r.Header.Set("Authorization", "Bearer at2_000000000000_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+			r.Header.Set("Authorization", "Bearer at2_000000000000_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") // gitleaks:allow (fake)
 		},
 	}
 	for name, mutate := range cases {
@@ -444,4 +444,35 @@ func TestValidVectorsRoundTripThroughPostgres(t *testing.T) {
 		n++
 	}
 	t.Logf("%d valid vectors round-tripped through Postgres jsonb and re-verified", n)
+}
+
+// TestAdminActionsNameTheOperator: an admin action carrying the SSO
+// operator (from the dashboard) is sealed with that person as principal;
+// a malformed value falls back to the admin token.
+func TestAdminActionsNameTheOperator(t *testing.T) {
+	e := setup(t)
+	for _, c := range []struct{ header, want string }{
+		{"alice@example.com", "alice@example.com"},
+		{"bad value with spaces", "admin-token"},
+		{"", "admin-token"},
+	} {
+		req, _ := http.NewRequest("POST", e.http.URL+"/v1/admin/tenants", strings.NewReader(`{"name":"operator-test"}`))
+		req.Header.Set("Authorization", "Bearer "+e.admin)
+		if c.header != "" {
+			req.Header.Set("X-AuditTrail-Operator", c.header)
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil || res.StatusCode != 201 {
+			t.Fatalf("create tenant: %v %v", err, res)
+		}
+		var out struct {
+			APIKey string `json:"api_key"`
+		}
+		_ = json.NewDecoder(res.Body).Decode(&out)
+		res.Body.Close()
+		code, body := get(t, e, out.APIKey, "/v1/events?action=tenant.created")
+		if code != 200 || !strings.Contains(string(body), `"`+c.want+`"`) {
+			t.Fatalf("header %q: want principal %q in %s", c.header, c.want, body)
+		}
+	}
 }

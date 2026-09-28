@@ -2,7 +2,8 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { Sidebar } from "@/components/at/sidebar";
 import { Toaster } from "@/components/at/toast";
-import { api } from "@/lib/api";
+import { headers } from "next/headers";
+import { api, operator } from "@/lib/api";
 import type { Tenant } from "@/lib/types";
 import "./globals.css";
 
@@ -15,11 +16,15 @@ export const metadata: Metadata = {
 };
 
 export default async function RootLayout({ children }: LayoutProps<"/">) {
-  const tenants = await api<{ tenants: Tenant[] }>("/v1/admin/tenants").then((r) => r.tenants).catch(() => [] as Tenant[]);
+  // Tenant names are only for signed-in operators (public pages like /verify share this layout).
+  const authed = (await headers()).get("x-at-authed") === "1";
+  const tenants = authed ? await api<{ tenants: Tenant[] }>("/v1/admin/tenants").then((r) => r.tenants).catch(() => [] as Tenant[]) : [];
+  const who = authed ? await operator() : null;
+  const sso = Boolean(process.env.OIDC_ISSUER);
   return (
     <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}>
       <body className="flex min-h-full bg-zinc-50 font-sans text-foreground dark:bg-background">
-        <Sidebar tenants={[...tenants].reverse().map((t) => ({ id: t.id, name: t.name, legal_hold: t.legal_hold }))} />
+        <Sidebar tenants={[...tenants].reverse().map((t) => ({ id: t.id, name: t.name, legal_hold: t.legal_hold }))} operator={who} sso={sso && authed} />
         <main className="min-w-0 flex-1">{children}</main>
         <Toaster />
       </body>

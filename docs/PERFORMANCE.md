@@ -29,3 +29,7 @@ cd packages/ingestion-go
 read TID KEY < <(./bin/loadgen -n 20000 -out /tmp/load.jsonl)
 k6 run -e FILE=/tmp/load.jsonl -e KEY=$KEY -e VUS=64 ../../tests/load/ingest.js
 ```
+
+## Shared rate limiter overhead
+
+Tenant rate limits are enforced across instances through Postgres (leased token batches). Same machine, 10k writers, 128 in flight, 3 runs each: **6,073 events/s shared vs 6,131 local** (about 1%).
