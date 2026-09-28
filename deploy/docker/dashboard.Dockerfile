@@ -3,7 +3,7 @@
 #   docker build -f deploy/docker/dashboard.Dockerfile -t audittrail/dashboard .
 
 # The build emits platform-independent JS, so it runs natively on the build host.
-FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS build
+FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:0b36e8c136b94cd4fcf02188228e76c31ad5872eef3fec8cbd2eee500cfd9e80 AS build
 WORKDIR /src
 RUN corepack enable
 COPY pnpm-lock.yaml pnpm-workspace.yaml package.json tsconfig.base.json ./
@@ -23,7 +23,7 @@ RUN pnpm --filter @audittrail/core build \
  && mkdir -p .next/standalone/apps/dashboard/.next \
  && cp -r .next/static .next/standalone/apps/dashboard/.next/
 
-FROM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
+FROM node:26-alpine@sha256:0b36e8c136b94cd4fcf02188228e76c31ad5872eef3fec8cbd2eee500cfd9e80
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
 WORKDIR /app
 COPY --from=build --chown=node:node /src/apps/dashboard/.next/standalone ./
