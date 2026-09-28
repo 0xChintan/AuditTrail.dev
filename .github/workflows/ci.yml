@@ -18,7 +18,7 @@ jobs:
       AUDITTRAIL_ADMIN_TOKEN: ci-admin-token
       AUDITTRAIL_KEY_PEPPER: ci-pepper-ci-pepper-ci-pepper-ci
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
       - run: go build ./...
@@ -32,7 +32,7 @@ jobs:
   node:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: pnpm }
@@ -45,7 +45,7 @@ jobs:
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { fetch-depth: 0 }   # gitleaks scans full history
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
