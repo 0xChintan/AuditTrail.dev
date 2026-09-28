@@ -40,7 +40,7 @@ jobs:
           go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
           cyclonedx-gomod mod -json -licenses -output dist/sbom-go.cdx.json .
           (cd dist && sha256sum * > SHA256SUMS)
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with: { subject-path: "dist/*" }
       - uses: sigstore/cosign-installer@v3
       - name: sign (Sigstore keyless)
@@ -97,7 +97,7 @@ jobs:
           tags: ${{ steps.meta.outputs.image }}:${{ github.ref_name }}
           provenance: mode=max
           sbom: true
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ steps.meta.outputs.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
