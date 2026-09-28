@@ -13,7 +13,7 @@ require (
 	gocloud.dev/secrets/hashivault v0.46.0
 	golang.org/x/mod v0.41.0
 	golang.org/x/time v0.16.0
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
