@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.next/
+*.tsbuildinfo
+.env
+.env.local
+/bin/
+packages/ingestion-go/bin/
+.audittrail/
+coverage/
+*.log
+.DS_Store

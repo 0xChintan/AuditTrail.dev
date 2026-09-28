@@ -1,0 +1,23 @@
+{
+  "name": "audittrail",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tamper-evident, hash-chained audit ledger for human and AI-agent actions",
+  "packageManager": "pnpm@11.0.9",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter ./packages/* build",
+    "test": "pnpm -r --filter ./packages/* test",
+    "typecheck": "pnpm -r typecheck",
+    "go:build": "go build ./...",
+    "go:test": "go test ./..."
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "tsup": "^8.5.0",
+    "vitest": "^3.2.0",
+    "@types/node": "^24.0.0"
+  }
+}

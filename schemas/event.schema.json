@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://audittrail.dev/schemas/event.v1.json",
+  "title": "AuditTrail event (submission)",
+  "description": "An event submitted to POST /v1/events. The server seals it into the tenant's hash chain. See schemas/SPEC.md for the canonical hashing rules.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["agent_id", "action", "target_resource", "outcome"],
+  "properties": {
+    "id": {
+      "description": "Client-generated UUID. Doubles as the idempotency key: re-submitting the same id with the same content returns the already-sealed record. Server generates one if omitted.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "timestamp": {
+      "description": "When the action happened (RFC 3339). Truncated to millisecond precision and normalized to UTC before hashing. Defaults to server receive time.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "human_principal_id": {
+      "description": "The human on whose behalf the action ran. null = fully autonomous or not known.",
+      "type": ["string", "null"],
+      "maxLength": 512
+    },
+    "agent_id": {
+      "description": "The acting agent or service. Use \"unknown\" rather than omitting.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "model_id": { "type": ["string", "null"], "maxLength": 256 },
+    "model_version": { "type": ["string", "null"], "maxLength": 256 },
+    "delegation_chain": {
+      "description": "Ordered ancestry of the action, outermost principal first. Each frame is an object with at least a `type` and an `id`.",
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": ["type", "id"],
+        "properties": {
+          "type": { "type": "string" },
+          "id": { "type": "string" }
+        }
+      }
+    },
+    "action": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "target_resource": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "outcome": { "type": "string", "enum": ["allowed", "denied", "error"] },
+    "metadata": { "type": ["object", "null"] },
+    "previous_hash": {
+      "description": "Optimistic mode only. If present, must equal the tenant's current chain head or the server responds 409.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "hash": {
+      "description": "Optimistic mode only. If present, must equal the server's recomputation or the server responds 409.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

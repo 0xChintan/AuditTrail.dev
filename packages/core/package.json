@@ -1,0 +1,50 @@
+{
+  "name": "@audittrail/core",
+  "version": "0.1.0",
+  "description": "AuditTrail ledger spec in TypeScript: RFC 8785 canonicalization, chain hashing, Ed25519 + Merkle verification. Zero dependencies; runs in Node and browsers.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0",
+    "@types/node": "^24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/audittrail-dev/audittrail.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://audittrail.dev",
+  "bugs": {
+    "url": "https://github.com/audittrail-dev/audittrail/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": []
+}

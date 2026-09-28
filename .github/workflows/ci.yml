@@ -1,0 +1,39 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-retries 10
+    env:
+      DATABASE_ADMIN_URL: postgres://postgres:postgres@localhost:5432/audittrail?sslmode=disable
+      AUDITTRAIL_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      AUDITTRAIL_ADMIN_TOKEN: ci-admin-token
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: go build ./...
+      - working-directory: packages/ingestion-go
+        run: |
+          go build -o bin/ ./cmd/...
+          ./bin/migrate
+          go test ./...
+          (LISTEN_ADDR=:8080 ./bin/api &) && sleep 2
+          ./bin/stress -n 1000
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r --filter "./packages/*" build
+      - run: pnpm -r --filter "./packages/*" test
+      - run: pnpm --filter @audittrail/dashboard build
+        env: { AUDITTRAIL_ADMIN_TOKEN: ci }
