@@ -156,14 +156,13 @@ func (w *Worker) CheckpointTenant(ctx context.Context, tenantID string) (*ledger
 		if e.PreviousHash != prev {
 			return nil, &IntegrityError{tenantID, e.Seq, "previous_hash does not link"}
 		}
-		ce, err := e.CanonEvent()
-		if err != nil {
-			return nil, &IntegrityError{tenantID, e.Seq, err.Error()}
-		}
-		if h, _, err := canon.HashEvent(e.PreviousHash, ce); err != nil || h != e.Hash {
+		if h, err := e.RecomputeHash(); err != nil || h != e.Hash {
 			return nil, &IntegrityError{tenantID, e.Seq, "content does not match hash"}
 		}
-		if pk, ok := pubs[e.KeyID]; !ok || !keys.Verify(pk, canon.EventSigningMessage(e.Hash), e.Signature) {
+		if !e.PayloadIntact() {
+			return nil, &IntegrityError{tenantID, e.Seq, "payload does not match payload_hash"}
+		}
+		if pk, ok := pubs[e.KeyID]; !ok || !keys.Verify(pk, e.SigningMessage(), e.Signature) {
 			return nil, &IntegrityError{tenantID, e.Seq, "bad row signature"}
 		}
 		hashes = append(hashes, e.Hash)

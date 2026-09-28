@@ -2,7 +2,8 @@
 
 import { useState } from "react";
 import { CheckCircle2Icon, LoaderIcon, ShieldCheckIcon, XCircleIcon, InfoIcon } from "lucide-react";
-import { canonicalPayload, ed25519Verify, utf8, verifyInclusion, verifyRecord, type Checkpoint, type PublicKey, type SealedRecord } from "@audittrail/core";
+import { canonicalPayload, type SealedRecord } from "@audittrail/core";
+import { verifyBundleWasm } from "@/lib/wasm-verifier";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { fmtTime } from "@/lib/format";
@@ -34,38 +35,31 @@ export function EventSheet({ event, tenant, onClose }: { event: SealedRecord | n
     setBusy(true);
     const out: Check[] = [];
     try {
-      const res = await fetch(`/api/at/v1/events/${e.id}/proof?tenant=${tenant}`);
-      const body = await res.json();
-      let keys: PublicKey[];
-      let cp: Checkpoint | null = null;
-      let proof: { leaf_index: number; tree_size: number; inclusion_path: string[] } | null = null;
-      if (res.ok) {
-        keys = body.public_keys;
-        cp = body.checkpoint;
-        proof = body;
-      } else {
-        keys = (await (await fetch(`/api/pubkeys/${e.tenant_id}`)).json()).keys;
+      // A minimal evidence bundle for this one row (widened to its signed tree
+      // head), verified by the offline WASM verifier with the log key pinned.
+      const [bundle, log] = await Promise.all([
+        fetch(`/api/at/v2/export?tenant=${tenant}&from_seq=${e.seq}&to_seq=${e.seq}`).then((r) => r.text()),
+        fetch(`/api/at/v2/tenants/${e.tenant_id}/log?tenant=${tenant}`).then((r) => r.json()),
+      ]);
+      const rep = await verifyBundleWasm(bundle, { log_keys: log.vkeys });
+      const label: Record<string, string> = {
+        "content-hash": "Hash recomputed from this record's content",
+        "payload-hash": "Payload matches its payload_hash",
+        "row-signature": `Receipt signature (${e.key_id})`,
+        "chain-link": "Links to the previous record",
+        "tree-root": "Reproduces the signed Merkle root of its tree head",
+        "checkpoint-signature": "Tree head signed by the tenant log key (pinned)",
+        consistency: "Tree heads are append-only",
+        coverage: "Covered by a signed tree head",
+      };
+      for (const [inv, text] of Object.entries(label)) {
+        const c = rep.checks[inv];
+        if (!c) continue;
+        const warn = rep.warnings.find((w) => w.invariant === inv);
+        out.push({ label: text, ok: c.status === "pass" && !warn ? true : c.status === "fail" ? false : null, detail: warn?.detail ?? (c.status === "fail" ? c.detail : undefined) });
       }
-      const rc = await verifyRecord(e, keys);
-      out.push({ label: "Hash recomputed from content (RFC 8785 + SHA-256)", ok: rc.hashMatches, detail: rc.recomputedHash });
-      out.push({ label: `Ed25519 signature (${e.key_id})`, ok: rc.signatureValid });
-      if (cp && proof) {
-        out.push({
-          label: `Included in checkpoint Merkle root (leaf ${proof.leaf_index + 1} of ${proof.tree_size})`,
-          ok: await verifyInclusion(e.hash, proof.leaf_index, proof.tree_size, proof.inclusion_path, cp.merkle_root),
-          detail: cp.merkle_root,
-        });
-        const st = JSON.parse(cp.statement);
-        const pk = keys.find((k) => k.key_id === cp!.key_id)?.public_key ?? "";
-        out.push({ label: "Checkpoint statement signed by tenant key", ok: (await ed25519Verify(pk, utf8(cp.statement), cp.signature)) && st.merkle_root === cp.merkle_root });
-        out.push({
-          label: cp.anchor_status === "anchored" ? `Anchored by ${cp.anchor_authority} at ${cp.anchored_at}` : `External anchor: ${cp.anchor_status}`,
-          ok: cp.anchor_status === "anchored" ? true : null,
-          detail: cp.anchor_status === "anchored" ? "TSA token signature is validated by audittrail-verify / server verification" : undefined,
-        });
-      } else {
-        out.push({ label: "Not yet covered by a checkpoint (next worker run)", ok: null });
-      }
+      if (rep.witnessed_by?.length) out.push({ label: `Cosigned by ${rep.witnessed_by.length} witness(es): ${rep.witnessed_by.join(", ")}`, ok: null });
+      if (rep.anchored_at) out.push({ label: `RFC 3161 anchor ${rep.anchored_at}`, ok: true });
     } catch (err) {
       out.push({ label: `Verification failed to run: ${String(err)}`, ok: false });
     }
@@ -134,7 +128,7 @@ export function EventSheet({ event, tenant, onClose }: { event: SealedRecord | n
               </section>
               <details className="text-xs">
                 <summary className="cursor-pointer text-muted-foreground">Canonical payload that was hashed</summary>
-                <pre className="mt-2 overflow-auto rounded-lg bg-muted p-3 text-[11px] break-all whitespace-pre-wrap">{canonicalPayload(event)}</pre>
+                <pre className="mt-2 overflow-auto rounded-lg bg-muted p-3 text-[11px] break-all whitespace-pre-wrap">{(event as { spec_version?: number }).spec_version === 2 ? "spec_version 2: the record hash is SHA-256 over length-prefixed fields (schemas/v2/SPEC.md §3); the payload is committed via payload_hash." : canonicalPayload(event)}</pre>
               </details>
             </div>
           </>

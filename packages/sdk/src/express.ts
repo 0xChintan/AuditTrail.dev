@@ -1,5 +1,5 @@
 import type { AuditTrail } from "./client.js";
-import type { Outcome } from "@audittrail/core";
+import type { Outcome } from "./client.js";
 
 // Minimal structural types so the SDK doesn't depend on @types/express.
 interface Req {
@@ -16,7 +16,7 @@ interface Res {
 }
 
 export interface ExpressAuditOptions {
-  /** Who is acting. Default: req.user?.id ?? null */
+  /** Who is acting. Default: req.user?.id as a human principal, else null */
   principal?: (req: Req) => string | null | undefined;
   /** Action name. Default: "http.<method>" e.g. "http.delete" */
   action?: (req: Req) => string;
@@ -47,13 +47,14 @@ export function auditTrailMiddleware(client: AuditTrail, opts: ExpressAuditOptio
     const timestamp = new Date();
     res.on("finish", () => {
       const user = (req as { user?: { id?: string } }).user;
+      const pid = opts.principal ? opts.principal(req) : user?.id;
       client.track({
-        timestamp,
-        human_principal_id: opts.principal ? (opts.principal(req) ?? null) : (user?.id ?? null),
+        occurredAt: timestamp,
+        principal: pid ? { id: pid, type: "human" } : null,
         action: opts.action ? opts.action(req) : `http.${req.method.toLowerCase()}`,
-        target_resource: opts.resource ? opts.resource(req) : (req.originalUrl ?? req.url).split("?")[0]!,
+        resource: opts.resource ? opts.resource(req) : (req.originalUrl ?? req.url).split("?")[0]!,
         outcome: outcomeFromStatus(res.statusCode),
-        metadata: { status: res.statusCode, duration_ms: Date.now() - started, ip: req.ip ?? null, ...(opts.metadata?.(req, res) ?? {}) },
+        payload: { status: res.statusCode, duration_ms: Date.now() - started, ip: req.ip ?? null, ...(opts.metadata?.(req, res) ?? {}) },
       });
     });
     next();

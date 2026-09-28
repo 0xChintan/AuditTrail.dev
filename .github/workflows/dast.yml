@@ -1,0 +1,44 @@
+name: dast
+# OWASP ZAP baseline scans of the running API and dashboard (v2 task 6.1).
+# Fails on any WARN/FAIL not listed in .zap/rules.tsv.
+on:
+  push: { branches: [main] }
+  pull_request:
+  schedule: [{ cron: "17 3 * * 1" }]
+permissions:
+  contents: read
+jobs:
+  zap:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-retries 10
+    env:
+      DATABASE_ADMIN_URL: postgres://postgres:postgres@localhost:5432/audittrail?sslmode=disable
+      AUDITTRAIL_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      AUDITTRAIL_ADMIN_TOKEN: ci-admin-token
+      AUDITTRAIL_KEY_PEPPER: ci-pepper-ci-pepper-ci-pepper-ci
+      AUDITTRAIL_API_URL: http://localhost:8080
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile && pnpm -r --filter "./packages/*" build
+      - working-directory: packages/ingestion-go
+        run: |
+          go build -o bin/ ./cmd/...
+          ./bin/migrate
+          (LISTEN_ADDR=:8080 ./bin/api &)
+      - run: pnpm --filter @audittrail/dashboard build && (pnpm --filter @audittrail/dashboard start &) && sleep 8
+      - name: ZAP baseline (API)
+        uses: zaproxy/action-baseline@v0.14.0
+        with: { target: "http://localhost:8080/healthz", rules_file_name: ".zap/rules.tsv", fail_action: true, allow_issue_writing: false }
+      - name: ZAP baseline (dashboard)
+        uses: zaproxy/action-baseline@v0.14.0
+        with: { target: "http://localhost:3000/verify", rules_file_name: ".zap/rules.tsv", fail_action: true, allow_issue_writing: false }

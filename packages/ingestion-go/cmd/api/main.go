@@ -34,12 +34,25 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := db.Connect(ctx, config.AppDBURL(), int32(config.Int("DB_MAX_CONNS", 20)))
+	maxConns := min(max(config.Int("DB_MAX_CONNS", 20), 1), 1000)
+	pool, err := db.Connect(ctx, config.AppDBURL(), int32(maxConns)) // #nosec G115 -- clamped to 1..1000
 	if err != nil {
 		log.Error("database", "err", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
+
+	control, err := db.Connect(ctx, config.ControlDBURL(), 5)
+	if err != nil {
+		log.Error("control database", "err", err)
+		os.Exit(1)
+	}
+	defer control.Close()
+	pepper, err := keys.ParsePepper(os.Getenv("AUDITTRAIL_KEY_PEPPER"))
+	if err != nil {
+		log.Error("config", "err", err)
+		os.Exit(1)
+	}
 
 	var cors []string
 	for _, o := range strings.Split(config.Str("CORS_ORIGINS", "http://localhost:3000"), ",") {
@@ -47,11 +60,18 @@ func main() {
 			cors = append(cors, o)
 		}
 	}
-	srv := api.New(pool, master, os.Getenv("AUDITTRAIL_ADMIN_TOKEN"), cors, log)
+	srv := api.New(pool, control, master, pepper, os.Getenv("AUDITTRAIL_ADMIN_TOKEN"), cors, log)
+	if n := config.Int("SEQUENCER_MAX_BATCH", 256); n > 0 {
+		srv.Seq.MaxBatch = n
+	}
 	api.RegisterExtensions(srv)
+	srv.StartNonceJanitor(ctx)
+	srv.StartMonitor(ctx, config.Dur("MONITOR_INTERVAL", 30*time.Second))
 
 	addr := config.Str("LISTEN_ADDR", ":8080")
-	hs := &http.Server{Addr: addr, Handler: srv, ReadHeaderTimeout: 10 * time.Second}
+	// Timeouts bound slow clients (slowloris-style bodies, stalled readers).
+	hs := &http.Server{Addr: addr, Handler: srv, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
+		WriteTimeout: 120 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -30,6 +30,7 @@ type Template struct {
 	Clauses          []Clause       `json:"clauses"`
 	Fields           []FieldMapping `json:"fields"`
 	HighlightOutcome []string       `json:"highlight_outcomes"`
+	Applicability    string         `json:"applicability,omitempty"`
 }
 
 var integrityFields = []string{"seq", "previous_hash", "hash", "signature", "key_id"}
@@ -43,6 +44,7 @@ var Templates = []Template{
 			"against later alteration, attributable to the humans, agents and models involved, and kept for at least six months.",
 		MinRetentionDays: 183,
 		RetentionClause:  "Art. 19(1) / Art. 26(6)",
+		Applicability:    "Timeline: after the Digital Omnibus amendment, Article 12 logging applies to Annex III high-risk systems from 2 December 2027 and to Annex I (product-embedded) systems from 2 August 2028. Confirm current dates for your system with counsel.",
 		HighlightOutcome: []string{"denied", "error"},
 		Clauses: []Clause{
 			{"Art. 12(1)", "Automatic recording of events", "High-risk AI systems must technically allow the automatic recording of events (logs) over the lifetime of the system.",
@@ -76,6 +78,9 @@ var Templates = []Template{
 			{"hash", "hash", []string{"Art. 12(1)", "Art. 19(1) / Art. 26(6)"}, "SHA-256 over previous_hash and the canonical record. Any edit changes it."},
 			{"signature", "signature", []string{"Art. 12(1)"}, "Ed25519 signature by the tenant key over the hash."},
 			{"checkpoint", "checkpoint_id / anchor", []string{"Art. 12(1)", "Art. 19(1) / Art. 26(6)"}, "Signed Merkle checkpoint covering the row, time-stamped by an independent RFC 3161 authority."},
+			{"received_at", "received_at", []string{"Art. 12(1)", "Art. 12(3)(a)"}, "Server-assigned receipt time (trusted), alongside the client-reported occurred_at."},
+			{"tree_head", "tree head + witness cosignatures", []string{"Art. 12(1)", "Art. 19(1) / Art. 26(6)"}, "C2SP checkpoint over the whole log, cosigned by independent witnesses: rewriting or forking history is detectable by anyone."},
+			{"pii_ct", "pii (encrypted)", []string{"Art. 12(3)(d)"}, "Personal data encrypted per subject; can be crypto-shredded without breaking the log (GDPR Art. 17 interplay)."},
 		},
 	},
 	{

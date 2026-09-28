@@ -17,6 +17,13 @@ export function ExportCard({ t, tenant, retentionDays }: { t: Template; tenant: 
     if (to) q.set("to", to);
     return `/api/at/v1/export?${q}`;
   };
+  // v2 evidence bundle: tree heads + witness cosignatures + proofs, for `audittrail-verify --log-key --witness`.
+  const bundleV2 = () => {
+    const q = new URLSearchParams({ tenant });
+    if (from) q.set("from", from);
+    if (to) q.set("to", to);
+    return `/api/at/v2/export?${q}`;
+  };
   const meets = retentionDays >= t.min_retention_days;
   return (
     <Card>
@@ -41,7 +48,8 @@ export function ExportCard({ t, tenant, retentionDays }: { t: Template; tenant: 
         <div className="flex flex-wrap gap-2">
           <a className={buttonVariants({ size: "sm" })} href={href("pdf")}><FileTextIcon /> PDF report</a>
           <a className={buttonVariants({ size: "sm", variant: "outline" })} href={href("csv")}><FileSpreadsheetIcon /> CSV</a>
-          <a className={buttonVariants({ size: "sm", variant: "outline" })} href={href("bundle")}><FileJsonIcon /> Evidence bundle</a>
+          <a className={buttonVariants({ size: "sm", variant: "outline" })} href={bundleV2()}><FileJsonIcon /> Evidence bundle</a>
+          <a className={buttonVariants({ size: "sm", variant: "ghost" })} href={href("bundle")} title="Legacy v1 bundle (checkpoints + RFC 3161 anchors) for v1-era records"><FileJsonIcon /> v1 bundle</a>
         </div>
         <details className="text-xs">
           <summary className="cursor-pointer text-muted-foreground">Field → clause mapping</summary>

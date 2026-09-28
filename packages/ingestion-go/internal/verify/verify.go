@@ -222,11 +222,11 @@ func Verify(b Bundle, opt Options) Report {
 			rep.add("error", "wrong_tenant", e.Seq, e.ID, "", "row belongs to tenant %s", e.TenantID)
 			rep.tampered(e.Seq)
 		}
-		// 1. content -> hash
-		ce, err := e.CanonEvent()
-		var recomputed string
-		if err == nil {
-			recomputed, _, err = canon.HashEvent(e.PreviousHash, ce)
+		// 1. content -> hash (rules of the row's spec_version)
+		recomputed, err := e.RecomputeHash()
+		if err == nil && !e.PayloadIntact() {
+			rep.add("error", "payload_tampered", e.Seq, e.ID, "", "row %d payload does not match its payload_hash", e.Seq)
+			rep.tampered(e.Seq)
 		}
 		if err != nil {
 			rep.add("error", "unhashable_row", e.Seq, e.ID, "", "cannot canonicalize row: %v", err)
@@ -257,7 +257,7 @@ func Verify(b Bundle, opt Options) Report {
 		pk, ok := pub[e.KeyID]
 		if !ok {
 			rep.add("error", "unknown_key", e.Seq, e.ID, "", "signing key %s not in bundle", e.KeyID)
-		} else if !keys.Verify(pk, canon.EventSigningMessage(e.Hash), e.Signature) {
+		} else if !keys.Verify(pk, e.SigningMessage(), e.Signature) {
 			rep.add("error", "bad_signature", e.Seq, e.ID, "", "Ed25519 signature does not verify")
 			rep.tampered(e.Seq)
 		} else {

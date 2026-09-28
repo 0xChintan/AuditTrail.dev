@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { KeyRoundIcon, RotateCwIcon, TriangleAlertIcon } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from "@/components/at/toast";
 import { createApiKey, revokeApiKey, rotateSigningKey } from "@/app/actions";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";

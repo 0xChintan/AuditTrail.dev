@@ -75,14 +75,16 @@ func Bool(k string, def bool) bool {
 }
 
 const (
-	DefaultAppURL    = "postgres://audittrail_app:audittrail_app@localhost:5432/audittrail?sslmode=disable"
-	DefaultWorkerURL = "postgres://audittrail_worker:audittrail_worker@localhost:5432/audittrail?sslmode=disable"
-	DefaultPurgeURL  = "postgres://audittrail_purge:audittrail_purge@localhost:5432/audittrail?sslmode=disable"
+	DefaultAppURL     = "postgres://audittrail_app:audittrail_app@localhost:5432/audittrail?sslmode=disable"
+	DefaultWorkerURL  = "postgres://audittrail_worker:audittrail_worker@localhost:5432/audittrail?sslmode=disable"
+	DefaultControlURL = "postgres://audittrail_control:audittrail_control@localhost:5432/audittrail?sslmode=disable"
+	DefaultPurgeURL   = "postgres://audittrail_purge:audittrail_purge@localhost:5432/audittrail?sslmode=disable"
 )
 
-func AppDBURL() string    { return Str("DATABASE_URL", DefaultAppURL) }
-func WorkerDBURL() string { return Str("DATABASE_WORKER_URL", DefaultWorkerURL) }
-func PurgeDBURL() string  { return Str("DATABASE_PURGE_URL", DefaultPurgeURL) }
+func AppDBURL() string     { return Str("DATABASE_URL", DefaultAppURL) }
+func WorkerDBURL() string  { return Str("DATABASE_WORKER_URL", DefaultWorkerURL) }
+func PurgeDBURL() string   { return Str("DATABASE_PURGE_URL", DefaultPurgeURL) }
+func ControlDBURL() string { return Str("DATABASE_CONTROL_URL", DefaultControlURL) }
 func AdminDBURL() string {
 	return Str("DATABASE_ADMIN_URL", "postgres://localhost:5432/audittrail?sslmode=disable")
 }

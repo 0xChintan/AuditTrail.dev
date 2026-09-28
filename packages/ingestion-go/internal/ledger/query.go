@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Filter struct {
@@ -118,7 +117,7 @@ type NameCount struct {
 	Count int64  `json:"count"`
 }
 
-func GetStats(ctx context.Context, pool *pgxpool.Pool, tenantID string) (Stats, error) {
+func GetStats(ctx context.Context, pool Querier, tenantID string) (Stats, error) {
 	s := Stats{ByOutcome: map[string]int64{"allowed": 0, "denied": 0, "error": 0}}
 	var err error
 	if s.HeadHash, s.HeadSeq, err = Head(ctx, pool, tenantID); err != nil {

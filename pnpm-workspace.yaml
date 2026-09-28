@@ -6,3 +6,5 @@ allowBuilds:
   esbuild: true
   sharp: false
   unrs-resolver: false
+overrides:
+  esbuild: ">=0.28.1"

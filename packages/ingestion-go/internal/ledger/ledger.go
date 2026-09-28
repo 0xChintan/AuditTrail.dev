@@ -11,9 +11,11 @@ package ledger
 
 import (
 	"bytes"
-	crand "crypto/rand"
+
+	"audittrail.dev/packages/ingestion-go/internal/record"
 	"context"
 	"crypto/ed25519"
+	crand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,57 +33,41 @@ import (
 	"audittrail.dev/packages/ingestion-go/internal/keys"
 )
 
-// Record is a sealed ledger row as returned by the API.
-type Record struct {
-	ID               string          `json:"id"`
-	TenantID         string          `json:"tenant_id"`
-	Seq              int64           `json:"seq"`
-	Timestamp        string          `json:"timestamp"`
-	HumanPrincipalID *string         `json:"human_principal_id"`
-	AgentID          string          `json:"agent_id"`
-	ModelID          *string         `json:"model_id"`
-	ModelVersion     *string         `json:"model_version"`
-	DelegationChain  json.RawMessage `json:"delegation_chain"`
-	Action           string          `json:"action"`
-	TargetResource   string          `json:"target_resource"`
-	Outcome          string          `json:"outcome"`
-	Metadata         json.RawMessage `json:"metadata"`
-	PreviousHash     string          `json:"previous_hash"`
-	Hash             string          `json:"hash"`
-	Signature        string          `json:"signature"`
-	KeyID            string          `json:"key_id"`
-	CreatedAt        string          `json:"created_at"`
-}
-
-// CanonEvent returns the hashed subset of the record.
-func (r Record) CanonEvent() (canon.Event, error) {
-	ts, err := time.Parse(time.RFC3339Nano, r.Timestamp)
-	if err != nil {
-		return canon.Event{}, fmt.Errorf("seq %d: bad timestamp %q", r.Seq, r.Timestamp)
-	}
-	return canon.Event{
-		ID: r.ID, TenantID: r.TenantID, Timestamp: ts,
-		HumanPrincipalID: r.HumanPrincipalID, AgentID: r.AgentID,
-		ModelID: r.ModelID, ModelVersion: r.ModelVersion,
-		DelegationChain: r.DelegationChain, Action: r.Action,
-		TargetResource: r.TargetResource, Outcome: r.Outcome, Metadata: r.Metadata,
-	}, nil
-}
+// Record is a sealed ledger row (defined in package record so the verifier
+// can compile without the database driver, e.g. to WebAssembly).
+type Record = record.Record
 
 // SelectColumns is the column list ScanRecord expects.
 const SelectColumns = `id, tenant_id, seq, timestamp, human_principal_id, agent_id, model_id,
 	model_version, delegation_chain, action, target_resource, outcome, metadata,
-	previous_hash, hash, signature, key_id, created_at`
+	previous_hash, hash, signature, key_id, created_at,
+	spec_version, received_at, agent, principal, model, payload_hash, pii_ct`
 
 func ScanRecord(row pgx.Row) (Record, error) {
 	var r Record
 	var ts, created time.Time
-	var dc, md []byte
+	var dc, md, ag, pr, mo, pii []byte
+	var recv *time.Time
+	var sv int16
 	err := row.Scan(&r.ID, &r.TenantID, &r.Seq, &ts, &r.HumanPrincipalID, &r.AgentID, &r.ModelID,
 		&r.ModelVersion, &dc, &r.Action, &r.TargetResource, &r.Outcome, &md,
-		&r.PreviousHash, &r.Hash, &r.Signature, &r.KeyID, &created)
+		&r.PreviousHash, &r.Hash, &r.Signature, &r.KeyID, &created,
+		&sv, &recv, &ag, &pr, &mo, &r.PayloadHash, &pii)
 	if err != nil {
 		return r, err
+	}
+	r.SpecVersion = int(sv)
+	if recv != nil {
+		s := canon.FormatTime(*recv)
+		r.ReceivedAt = &s
+	}
+	for _, x := range []struct {
+		dst *json.RawMessage
+		src []byte
+	}{{&r.Agent, ag}, {&r.Principal, pr}, {&r.Model, mo}, {&r.PIICT, pii}} {
+		if x.src != nil {
+			*x.dst = json.RawMessage(x.src)
+		}
 	}
 	r.Timestamp = canon.FormatTime(ts)
 	r.CreatedAt = created.UTC().Format(time.RFC3339Nano)
@@ -233,7 +219,7 @@ func (s *Sealer) Seal(ctx context.Context, tenantID string, sub Submission) (rec
 		s.statsMu.Lock()
 		s.Retries++
 		s.statsMu.Unlock()
-		backoff := time.Duration(1+rand.IntN(4<<min(attempt, 5))) * time.Millisecond
+		backoff := time.Duration(1+rand.IntN(4<<min(attempt, 5))) * time.Millisecond // #nosec G404 -- retry jitter, not security-sensitive
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():

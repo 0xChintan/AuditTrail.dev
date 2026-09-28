@@ -6,7 +6,10 @@
 import net from "node:net";
 import { readFileSync } from "node:fs";
 import { AuditTrail } from "../packages/sdk/dist/index.js";
-import { verifyBundle } from "../packages/core/dist/index.js";
+import { execFileSync } from "node:child_process";
+import { writeFileSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const env = Object.fromEntries(readFileSync(new URL("../.env", import.meta.url), "utf8").split("\n")
   .filter((l) => l.includes("=") && !l.startsWith("#")).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
@@ -44,15 +47,15 @@ const created = await (await fetch(`${API}/v1/admin/tenants`, { method: "POST", 
 const tenantId = created.tenant.id;
 await plugIn();
 const errors = [];
-const at = new AuditTrail({ apiKey: created.api_key, baseUrl: `http://127.0.0.1:${PROXY_PORT}`, agentId: "sdk-e2e",
+const at = new AuditTrail({ apiKey: created.api_key, baseUrl: `http://127.0.0.1:${PROXY_PORT}`, agent: { id: "sdk-e2e" },
   retry: { baseDelayMs: 100, maxDelayMs: 500 }, timeoutMs: 2000, onError: (e) => errors.push(e.code) });
 
 log("record #1 with network up");
-await at.record({ action: "step.1", target_resource: "doc/1", outcome: "allowed" });
+await at.record({ action: "step.1", resource: "doc/1", outcome: "allowed" });
 
 log("unplugging network; recording #2..#6 while it is down");
 await unplug();
-const inflight = [2, 3, 4, 5, 6].map((i) => at.record({ action: `step.${i}`, target_resource: `doc/${i}`, outcome: i === 4 ? "denied" : "allowed" }));
+const inflight = [2, 3, 4, 5, 6].map((i) => at.record({ action: `step.${i}`, resource: `doc/${i}`, outcome: i === 4 ? "denied" : "allowed" }));
 await new Promise((r) => setTimeout(r, 1500));
 log(`  still pending locally: ${await at.pending()} (errors so far: ${errors.length})`);
 
@@ -60,18 +63,27 @@ log("restoring network, but the first reply will be lost after the server commit
 swallowNextResponse = true;
 await plugIn();
 const recs = await Promise.all(inflight);
-log(`all record() promises resolved: seqs ${recs.map((r) => r.seq).join(",")}`);
+log(`all record() promises resolved: seqs ${recs.map((r) => r?.seq).join(",")}`);
 await unplug();
 
 // ---- check the ledger directly ------------------------------------------------
 const h = { authorization: `Bearer ${created.api_key}` };
 const { events } = await (await fetch(`${API}/v1/events?limit=1000`, { headers: h })).json();
-const { keys } = await (await fetch(`${API}/v1/tenants/${tenantId}/public-keys`)).json();
 const actions = events.filter((e) => e.agent_id === "sdk-e2e").map((e) => e.action);
-const report = await verifyBundle({ format: "audittrail.bundle.v1", generated_at: "", tenant: { id: tenantId, name: "" }, public_keys: keys, events, checkpoints: [] });
+// Verify the whole log offline with the Go verifier, pinning the tenant's log key.
+const bundle = await (await fetch(`${API}/v2/export`, { headers: h })).text();
+const { vkeys } = await (await fetch(`${API}/v2/tenants/${tenantId}/log`)).json();
+const file = join(mkdtempSync(join(tmpdir(), "sdk-e2e-")), "bundle.json");
+writeFileSync(file, bundle);
+let verified = true;
+try {
+  execFileSync(new URL("../packages/ingestion-go/bin/verify", import.meta.url).pathname, ["--log-key", vkeys[0], file], { stdio: "ignore" });
+} catch {
+  verified = false;
+}
 const expected = ["step.1", "step.2", "step.3", "step.4", "step.5", "step.6"];
-const ok = JSON.stringify(actions) === JSON.stringify(expected) && report.ok;
+const ok = JSON.stringify(actions) === JSON.stringify(expected) && recs.every(Boolean) && verified;
 log(`ledger order: ${actions.join(" -> ")}`);
-log(`chain verified in-process: ok=${report.ok}, signatures=${report.signaturesVerified}, retries observed=${errors.length}`);
+log(`log verified offline (bin/verify, pinned key): ${verified}; retries observed=${errors.length}`);
 console.log(ok ? "PASS: events survived the outage, arrived in order, exactly once" : "FAIL");
 process.exit(ok ? 0 : 1);

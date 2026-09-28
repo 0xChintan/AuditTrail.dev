@@ -57,7 +57,7 @@ func build(t *testing.T) vectors {
 		{ID: "a1b2c3d4-0000-4000-8000-000000000002", TenantID: tenant, Timestamp: ts.Add(1500 * time.Millisecond),
 			AgentID: "claude-code@2.1.0", ModelID: sp("claude-opus-5-5"), ModelVersion: sp("unknown"),
 			DelegationChain: json.RawMessage(`[{"type":"human","id":"alice@example.com"},{"type":"agent","id":"claude-code@2.1.0"},{"type":"tool_call","id":"7","parent":null}]`),
-			Action: "mcp.tools/call", TargetResource: "mcp://filesystem/tools/write_file", Outcome: "denied",
+			Action:          "mcp.tools/call", TargetResource: "mcp://filesystem/tools/write_file", Outcome: "denied",
 			Metadata: json.RawMessage(`{"args":{"path":"/etc/passwd","text":"é ☃ 😀 \"quoted\" \n tab\t"},"n":[1e21,1e-7,0.1,-0,123456789012345680000,5e-324]}`)},
 		{ID: "a1b2c3d4-0000-4000-8000-000000000003", TenantID: tenant, Timestamp: ts.Add(3 * time.Second),
 			AgentID: "unknown", Action: "mcp.resources/read", TargetResource: "mcp://docs/resources/file:///a%20b", Outcome: "error"},

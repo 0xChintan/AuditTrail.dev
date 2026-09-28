@@ -25,12 +25,12 @@ export function withAuditTrail<C = unknown>(client: AuditTrail, opts: NextAuditO
     const resource = opts.resource ? opts.resource(req) : new URL(req.url).pathname;
     try {
       const res = await handler(req, ctx);
-      client.track({ timestamp, human_principal_id: principal, action, target_resource: resource, outcome: outcomeFromStatus(res.status),
-        metadata: { status: res.status, duration_ms: Date.now() - started, ...(opts.metadata?.(req, res) ?? {}) } });
+      client.track({ occurredAt: timestamp, principal: principal ? { id: principal, type: "human" } : null, action, resource, outcome: outcomeFromStatus(res.status),
+        payload: { status: res.status, duration_ms: Date.now() - started, ...(opts.metadata?.(req, res) ?? {}) } });
       return res;
     } catch (e) {
-      client.track({ timestamp, human_principal_id: principal, action, target_resource: resource, outcome: "error",
-        metadata: { error: String((e as Error)?.message ?? e), duration_ms: Date.now() - started } });
+      client.track({ occurredAt: timestamp, principal: principal ? { id: principal, type: "human" } : null, action, resource, outcome: "error",
+        payload: { error: String((e as Error)?.message ?? e), duration_ms: Date.now() - started } });
       throw e;
     }
   };

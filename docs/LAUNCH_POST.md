@@ -37,7 +37,7 @@ Retention is enforced by the database, not by policy documents. The application 
 ## Try it in 10 minutes
 
 ```sh
-git clone https://github.com/audittrail-dev/audittrail && cd audittrail
+git clone https://github.com/0xChintan/AuditTrail.dev && cd audittrail
 scripts/setup.sh && scripts/dev.sh
 ```
 

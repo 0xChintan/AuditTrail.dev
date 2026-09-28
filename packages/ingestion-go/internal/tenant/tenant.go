@@ -3,7 +3,10 @@ package tenant
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -29,10 +32,29 @@ type APIKey struct {
 	TenantID   string     `json:"tenant_id"`
 	Name       string     `json:"name"`
 	Prefix     string     `json:"prefix"`
+	Version    int        `json:"version"`
+	Scopes     []string   `json:"scopes"`
+	ExpiresAt  *time.Time `json:"expires_at"`
 	CreatedAt  time.Time  `json:"created_at"`
 	LastUsedAt *time.Time `json:"last_used_at"`
 	RevokedAt  *time.Time `json:"revoked_at"`
 }
+
+const apiKeyCols = `id, tenant_id, name, prefix, key_version, scopes, expires_at, created_at, last_used_at, revoked_at`
+
+func scanKey(r pgx.Row) (APIKey, error) {
+	var k APIKey
+	var v int16
+	err := r.Scan(&k.ID, &k.TenantID, &k.Name, &k.Prefix, &v, &k.Scopes, &k.ExpiresAt, &k.CreatedAt, &k.LastUsedAt, &k.RevokedAt)
+	k.Version = int(v)
+	return k, err
+}
+
+// DefaultScopes for new keys.
+var DefaultScopes = []string{"events:write", "events:read", "export:read"}
+
+// AllScopes that may be granted.
+var AllScopes = map[string]bool{"events:write": true, "events:read": true, "export:read": true, "subjects:erase": true, "pii:read": true, "otlp:write": true}
 
 type PublicKey struct {
 	KeyID     string     `json:"key_id"`
@@ -45,9 +67,21 @@ type PublicKey struct {
 var ErrNotFound = errors.New("not found")
 var ErrUnauthorized = errors.New("invalid or revoked API key")
 
+// Store: control-plane operations (onboarding, keys, settings) run on the
+// Control pool (audittrail_control); tenant-scoped reads run on the App pool
+// under row-level security.
 type Store struct {
-	Pool   *pgxpool.Pool
-	Master *keys.MasterKey
+	Pool    *pgxpool.Pool // app role, RLS-scoped
+	Control *pgxpool.Pool // control-plane role
+	Master  *keys.MasterKey
+	Pepper  keys.Pepper
+}
+
+func (s *Store) ctl() *pgxpool.Pool {
+	if s.Control != nil {
+		return s.Control
+	}
+	return s.Pool
 }
 
 const tenantCols = `id, name, retention_days, legal_hold, legal_hold_reason, legal_hold_set_at,
@@ -75,7 +109,7 @@ type CreateOptions struct {
 // signing key and a first API key — atomically. The plaintext API key is
 // returned exactly once.
 func (s *Store) Create(ctx context.Context, o CreateOptions) (Tenant, string, APIKey, PublicKey, error) {
-	tx, err := s.Pool.Begin(ctx)
+	tx, err := s.ctl().Begin(ctx)
 	if err != nil {
 		return Tenant{}, "", APIKey{}, PublicKey{}, err
 	}
@@ -93,7 +127,7 @@ func (s *Store) Create(ctx context.Context, o CreateOptions) (Tenant, string, AP
 	if err != nil {
 		return Tenant{}, "", APIKey{}, PublicKey{}, err
 	}
-	full, ak, err := s.insertAPIKey(ctx, tx, t.ID, "default")
+	full, ak, err := s.insertAPIKey(ctx, tx, t.ID, "default", DefaultScopes, nil)
 	if err != nil {
 		return Tenant{}, "", APIKey{}, PublicKey{}, err
 	}
@@ -112,21 +146,28 @@ func (s *Store) insertSigningKey(ctx context.Context, tx pgx.Tx, tenantID string
 	return pk, err
 }
 
-func (s *Store) insertAPIKey(ctx context.Context, tx pgx.Tx, tenantID, name string) (string, APIKey, error) {
-	full, prefix, hash := keys.NewAPIKey()
-	var k APIKey
-	err := tx.QueryRow(ctx, `INSERT INTO api_keys (tenant_id, name, prefix, key_hash) VALUES ($1,$2,$3,$4)
-		RETURNING id, tenant_id, name, prefix, created_at, last_used_at, revoked_at`,
-		tenantID, name, prefix, hash).Scan(&k.ID, &k.TenantID, &k.Name, &k.Prefix, &k.CreatedAt, &k.LastUsedAt, &k.RevokedAt)
+func (s *Store) insertAPIKey(ctx context.Context, tx pgx.Tx, tenantID, name string, scopes []string, expires *time.Time) (string, APIKey, error) {
+	if len(s.Pepper) == 0 {
+		return "", APIKey{}, errors.New("AUDITTRAIL_KEY_PEPPER not configured")
+	}
+	full, prefix, mac, pub := keys.NewAPIKeyV2(s.Pepper)
+	k, err := scanKey(tx.QueryRow(ctx, `INSERT INTO api_keys (tenant_id, name, prefix, key_version, key_hmac, sign_pub, scopes, expires_at)
+		VALUES ($1,$2,$3,2,$4,$5,$6,$7) RETURNING `+apiKeyCols, tenantID, name, prefix, mac, pub, scopes, expires))
 	return full, k, err
 }
 
+// Get is a control-plane read (any tenant).
 func (s *Store) Get(ctx context.Context, id string) (Tenant, error) {
-	return scanTenant(s.Pool.QueryRow(ctx, `SELECT `+tenantCols+` FROM tenants WHERE id=$1`, id))
+	return scanTenant(s.ctl().QueryRow(ctx, `SELECT `+tenantCols+` FROM tenants WHERE id=$1`, id))
+}
+
+// GetTx reads the tenant inside a tenant-scoped (RLS) transaction.
+func GetTx(ctx context.Context, tx pgx.Tx, id string) (Tenant, error) {
+	return scanTenant(tx.QueryRow(ctx, `SELECT `+tenantCols+` FROM tenants WHERE id=$1`, id))
 }
 
 func (s *Store) List(ctx context.Context) ([]Tenant, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT `+tenantCols+` FROM tenants ORDER BY created_at`)
+	rows, err := s.ctl().Query(ctx, `SELECT `+tenantCols+` FROM tenants ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -142,30 +183,77 @@ func (s *Store) List(ctx context.Context) ([]Tenant, error) {
 	return out, rows.Err()
 }
 
-// Authenticate resolves an API key to its tenant. Keys are looked up by
-// prefix and compared by constant-time hash comparison.
-func (s *Store) Authenticate(ctx context.Context, full string) (Tenant, string, error) {
-	prefix, ok := keys.ParseAPIKey(full)
-	if !ok {
-		return Tenant{}, "", ErrUnauthorized
-	}
-	var keyID, hash, tenantID string
-	var revoked *time.Time
-	var lastUsed *time.Time
-	err := s.Pool.QueryRow(ctx, `SELECT id, key_hash, tenant_id, revoked_at, last_used_at FROM api_keys WHERE prefix=$1`, prefix).
-		Scan(&keyID, &hash, &tenantID, &revoked, &lastUsed)
-	if err != nil || revoked != nil || !keys.HashesEqual(hash, keys.HashAPIKey(full)) {
-		return Tenant{}, "", ErrUnauthorized
-	}
-	if lastUsed == nil || time.Since(*lastUsed) > time.Minute {
-		_, _ = s.Pool.Exec(ctx, `UPDATE api_keys SET last_used_at=NOW() WHERE id=$1`, keyID)
-	}
-	t, err := s.Get(ctx, tenantID)
-	return t, keyID, err
+// Credential is an authenticated API key.
+type Credential struct {
+	KeyID    string
+	TenantID string
+	Version  int
+	Scopes   []string
+	SignPub  ed25519.PublicKey // v2 keys only
 }
 
-func (s *Store) CreateAPIKey(ctx context.Context, tenantID, name string) (string, APIKey, error) {
-	tx, err := s.Pool.Begin(ctx)
+func (c Credential) Has(scope string) bool {
+	for _, s := range c.Scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+// Authenticate resolves an API key (v1 at_… or v2 at2_…). Stored values are
+// compared in constant time; revoked and expired keys fail identically.
+func (s *Store) Authenticate(ctx context.Context, full string) (Credential, error) {
+	ver, prefix, ok := keys.ParseAnyAPIKey(full)
+	if !ok {
+		return Credential{}, ErrUnauthorized
+	}
+	var c Credential
+	var kv int16
+	var hash, mac, pub *string
+	var expires, revoked *time.Time
+	err := s.Pool.QueryRow(ctx, `SELECT id, tenant_id, key_version, key_hash, key_hmac, scopes, expires_at, revoked_at, sign_pub FROM auth_lookup_key($1)`, prefix).
+		Scan(&c.KeyID, &c.TenantID, &kv, &hash, &mac, &c.Scopes, &expires, &revoked, &pub)
+	if err != nil || int(kv) != ver {
+		return Credential{}, ErrUnauthorized
+	}
+	c.Version = int(kv)
+	switch c.Version {
+	case 1:
+		if hash == nil || !keys.HashesEqual(*hash, keys.HashAPIKey(full)) {
+			return Credential{}, ErrUnauthorized
+		}
+	case 2:
+		if mac == nil || len(s.Pepper) == 0 || !keys.HashesEqual(*mac, s.Pepper.HMAC(full)) {
+			return Credential{}, ErrUnauthorized
+		}
+		if pub != nil {
+			if b, err := base64.StdEncoding.DecodeString(*pub); err == nil && len(b) == ed25519.PublicKeySize {
+				c.SignPub = b
+			}
+		}
+	}
+	if revoked != nil || (expires != nil && time.Now().After(*expires)) {
+		return Credential{}, ErrUnauthorized
+	}
+	return c, nil
+}
+
+// Touch records key usage (throttled by the caller's cadence).
+func Touch(ctx context.Context, tx pgx.Tx, keyID string) {
+	_, _ = tx.Exec(ctx, `UPDATE api_keys SET last_used_at=NOW() WHERE id=$1 AND (last_used_at IS NULL OR last_used_at < NOW() - interval '1 minute')`, keyID)
+}
+
+func (s *Store) CreateAPIKey(ctx context.Context, tenantID, name string, scopes []string, expires *time.Time) (string, APIKey, error) {
+	for _, sc := range scopes {
+		if !AllScopes[sc] {
+			return "", APIKey{}, fmt.Errorf("unknown scope %q", sc)
+		}
+	}
+	if len(scopes) == 0 {
+		scopes = DefaultScopes
+	}
+	tx, err := s.ctl().Begin(ctx)
 	if err != nil {
 		return "", APIKey{}, err
 	}
@@ -173,7 +261,7 @@ func (s *Store) CreateAPIKey(ctx context.Context, tenantID, name string) (string
 	if _, err := s.Get(ctx, tenantID); err != nil {
 		return "", APIKey{}, err
 	}
-	full, k, err := s.insertAPIKey(ctx, tx, tenantID, name)
+	full, k, err := s.insertAPIKey(ctx, tx, tenantID, name, scopes, expires)
 	if err != nil {
 		return "", APIKey{}, err
 	}
@@ -181,16 +269,15 @@ func (s *Store) CreateAPIKey(ctx context.Context, tenantID, name string) (string
 }
 
 func (s *Store) ListAPIKeys(ctx context.Context, tenantID string) ([]APIKey, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id, tenant_id, name, prefix, created_at, last_used_at, revoked_at
-		FROM api_keys WHERE tenant_id=$1 ORDER BY created_at`, tenantID)
+	rows, err := s.ctl().Query(ctx, `SELECT `+apiKeyCols+` FROM api_keys WHERE tenant_id=$1 ORDER BY created_at`, tenantID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []APIKey{}
 	for rows.Next() {
-		var k APIKey
-		if err := rows.Scan(&k.ID, &k.TenantID, &k.Name, &k.Prefix, &k.CreatedAt, &k.LastUsedAt, &k.RevokedAt); err != nil {
+		k, err := scanKey(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, k)
@@ -199,7 +286,7 @@ func (s *Store) ListAPIKeys(ctx context.Context, tenantID string) ([]APIKey, err
 }
 
 func (s *Store) RevokeAPIKey(ctx context.Context, tenantID, keyID string) error {
-	ct, err := s.Pool.Exec(ctx, `UPDATE api_keys SET revoked_at=NOW() WHERE tenant_id=$1 AND id=$2 AND revoked_at IS NULL`, tenantID, keyID)
+	ct, err := s.ctl().Exec(ctx, `UPDATE api_keys SET revoked_at=NOW() WHERE tenant_id=$1 AND id=$2 AND revoked_at IS NULL`, tenantID, keyID)
 	if err != nil {
 		return err
 	}
@@ -220,7 +307,7 @@ type Settings struct {
 }
 
 func (s *Store) Update(ctx context.Context, id string, p Settings) (Tenant, error) {
-	return scanTenant(s.Pool.QueryRow(ctx, `UPDATE tenants SET
+	return scanTenant(s.ctl().QueryRow(ctx, `UPDATE tenants SET
 		name = COALESCE($2, name),
 		retention_days = COALESCE($3, retention_days),
 		legal_hold = COALESCE($4, legal_hold),
@@ -239,7 +326,7 @@ func (s *Store) Update(ctx context.Context, id string, p Settings) (Tenant, erro
 // remain verifiable: each row records its key_id and retired public keys
 // stay published.
 func (s *Store) RotateSigningKey(ctx context.Context, tenantID string) (PublicKey, error) {
-	tx, err := s.Pool.Begin(ctx)
+	tx, err := s.ctl().Begin(ctx)
 	if err != nil {
 		return PublicKey{}, err
 	}
@@ -259,7 +346,7 @@ func (s *Store) RotateSigningKey(ctx context.Context, tenantID string) (PublicKe
 }
 
 func (s *Store) PublicKeys(ctx context.Context, tenantID string) ([]PublicKey, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT key_id, algorithm, public_key, created_at, retired_at
+	rows, err := s.ctl().Query(ctx, `SELECT key_id, algorithm, public_key, created_at, retired_at
 		FROM signing_keys WHERE tenant_id=$1 ORDER BY created_at`, tenantID)
 	if err != nil {
 		return nil, err

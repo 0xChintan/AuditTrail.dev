@@ -14,3 +14,4 @@ export {
 export { merkleRoot, verifyInclusion } from "./merkle.js";
 export { verifyRecord, verifyBundle, type RecordCheck, type BundleReport, type Issue } from "./verify.js";
 export { sha256Hex, ed25519Verify, toHex, fromHex, toBase64, fromBase64, utf8 } from "./crypto.js";
+export * as v2 from "./v2/index.js";

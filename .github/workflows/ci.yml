@@ -1,5 +1,8 @@
 name: ci
-on: [push, pull_request]
+on: [push, pull_request, workflow_call]
+permissions:
+  contents: read
+
 jobs:
   go:
     runs-on: ubuntu-latest
@@ -13,6 +16,7 @@ jobs:
       DATABASE_ADMIN_URL: postgres://postgres:postgres@localhost:5432/audittrail?sslmode=disable
       AUDITTRAIL_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
       AUDITTRAIL_ADMIN_TOKEN: ci-admin-token
+      AUDITTRAIL_KEY_PEPPER: ci-pepper-ci-pepper-ci-pepper-ci
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -22,18 +26,41 @@ jobs:
         run: |
           go build -o bin/ ./cmd/...
           ./bin/migrate
-          go test ./...
-          (LISTEN_ADDR=:8080 ./bin/api &) && sleep 2
-          ./bin/stress -n 1000
+          go test -race -count=1 ./...
+          ./bin/stress -n 2000 -c 128 -spawn ./bin/api -kill-at 0.5
+
   node:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: pnpm }
+        with: { node-version: 24, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r --filter "./packages/*" build
-      - run: pnpm -r --filter "./packages/*" test
+      - run: pnpm -r --filter "./packages/*" test   # includes the v2 cross-language vectors
       - run: pnpm --filter @audittrail/dashboard build
         env: { AUDITTRAIL_ADMIN_TOKEN: ci }
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # gitleaks scans full history
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: install scanners
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.6.0
+          go install github.com/zricethezav/gitleaks/v8@v8.30.1
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
+          pipx install semgrep==1.176.0
+      - run: SKIP_RACE=1 GOTOOLCHAIN=auto scripts/security.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: sbom, path: build/sbom/ }

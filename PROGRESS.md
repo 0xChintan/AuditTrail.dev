@@ -18,27 +18,18 @@ Status of each blueprint phase and its Definition of Done (DoD), with the comman
 
 ## What needs you
 
-| # | Item | Status | Owner |
+v1 and v2 (phases 0–7) are built. What remains needs your accounts, other people, or a production environment:
+
+| # | Item | Why it can't be done here | See |
 |---|---|---|---|
-| 1 | Create the GitHub repo and push | ⏳ next | you |
-| 2 | Set the real repo URL in the package.json `repository` fields (placeholder: `github.com/audittrail-dev/audittrail`) | ⏳ after 1 | Claude, once you give the URL |
-| 3 | npm publish (`@audittrail` scope, 2FA, provenance) | ⏳ | you (moved to v2 7.3) |
-| 4 | One week of daily Claude Code use through the proxy | ⏳ | you, see `docs/TESTING_BACKLOG.md` |
-| 5 | Production hardening: KMS master key, shared rate limiter, SSO | ⏳ | v2 plan (1.2 / 5.1 / roadmap) |
-| 6 | Legal review of clause text in `internal/export/templates.go` | ⏳ | you + counsel |
-| 7 | Update the launch post and exports to the Digital Omnibus timeline (Annex III: 2 Dec 2027) | ⏳ | v2 6.2 |
-| 8 | Remaining v1 tests (dashboard browser tests, TSA outage, more MCP hosts, …) | ⏳ | `docs/TESTING_BACKLOG.md` |
-
-## Next: v2 secure-by-design build (phases 0–7)
-
-Starts after the repo is pushed and you say **go**. Each phase finishes only when its Gate passes. Proposed decisions (confirm or change before starting):
-
-1. Evolve this repo; add `spec_version`, so v1 rows keep verifying under v1 rules and new rows use the v2 length-prefixed hash.
-2. Run 3 local C2SP witnesses with a 2-of-3 quorum. Public witnesses are a roadmap item.
-3. Keep the replay-nonce cache in Postgres (no Redis).
-4. Install gosec, govulncheck, gitleaks, osv-scanner, semgrep and k6 locally. OWASP ZAP runs only in GitHub CI.
-
-Can't be done by Claude: the external pentest (7.1), the 15 validation calls (7.4) and npm/GitHub publishing (7.3).
+| 1 | External penetration test (API, dashboard, witness, SDK/sidecar supply chain) | needs an independent firm | `docs/ASVS-L2.md` |
+| 2 | 15 validation calls with compliance/security buyers | needs real people | `docs/VALIDATION.md` |
+| 3 | npm publish + GitHub release: `NPM_TOKEN` secret, 2FA on the `@audittrail` scope, push a `v0.2.0` tag | needs your npm/GitHub accounts | `docs/RELEASING.md` |
+| 4 | First green CI + ZAP (DAST) run on GitHub | ZAP needs Docker; runs on push | `.github/workflows/{ci,dast}.yml` |
+| 5 | Production: KEK/master key in a KMS, operator SSO + MFA, TLS at the edge + `sslmode=verify-full`, shared rate limiter | needs your infrastructure | `docs/ASVS-L2.md` open items |
+| 6 | Independent witnesses (other parties running `audittrail-witness`) | needs partners | `cmd/witness` |
+| 7 | Legal review of the clause text in `internal/export/templates.go` | needs counsel | |
+| 8 | One week of daily Claude Code use through the sidecar + remaining manual tests | needs you | `docs/TESTING_BACKLOG.md` |
 
 ## Deviations from the blueprint (and why)
 
@@ -46,3 +37,38 @@ Can't be done by Claude: the external pentest (7.1), the 15 validation calls (7.
 - **Schema additions** to Appendix A (names kept): `seq`, per-row `signature`/`key_id`, checkpoint `first_seq`/`last_seq`/`head_hash`/`statement`/anchor columns, plus `tenants`, `api_keys`, `signing_keys` and `purge_log` tables.
 - **SERIALIZABLE plus a per-tenant in-process queue.** The blueprint's SERIALIZABLE + FOR UPDATE is kept (with retries on 40001). The in-process queue stops requests within one instance from wasting retries on each other. Correctness across instances still comes from Postgres, as the two-instance stress test shows.
 - **Checkpoints sign a statement, not just the root.** The signed, time-stamped object is a canonical statement: root + seq range + head hash + previous checkpoint head. A bare root doesn't say which rows it covers.
+
+# v2 build log
+
+| Task | Gate | Result | Evidence |
+|---|---|---|---|
+| 0.1 Threat model + security policy | every threat has an owner and a test ID | ✅ | `THREAT_MODEL.md` (T1–T13 → A1–A7, S1–S6, C4, M1–M4, D1–D2, R3), `SECURITY.md` |
+| 0.2 Message contract + vectors | TS and Go pass all vectors byte for byte | ✅ | `schemas/v2/SPEC.md`, `schemas/v2/vectors.json` with **318 cases** (53 JCS, 50 valid, 126 hostile, 79 Merkle incl. RFC 6962 reference cross-check, 6 request signatures, 4 C2SP notes); `go test ./packages/ingestion-go/internal/contract`, `pnpm --filter @audittrail/core test` |
+| 0.3 CI security baseline | fails on any high finding; seeded fake secret caught | ✅ | `scripts/security.sh` (gosec, govulncheck, semgrep, osv-scanner, gitleaks + canary, `go test -race`, CycloneDX SBOM for Go and JS). Fixed along the way: x/text infinite-loop CVE (GO-2026-5970), 4 integer-conversion findings, vitest/esbuild advisories. A planted G404 made the pipeline fail as expected |
+| 1.1 Schema + RLS | S5 cross-tenant read/write blocked; UPDATE/DELETE denied | ✅ | `migrations/004_v2_core.sql`: RLS on every tenant table, `SET LOCAL app.tenant_id` per transaction, fail-closed. `TestS5TenantIsolation` covers API IDOR, raw SQL, WITH CHECK, no-tenant and ledger UPDATE |
+| 1.2 Auth | S1–S4 rejected | ✅ | `at2_` keys stored as HMAC(pepper); scopes, expiry, revocation; Ed25519 request signatures (key derived via HKDF from the API key; the server stores only the public key); ±5 min skew; nonce cache. `TestS1…S4`, `TestScopes`; 401 bodies never reveal the reason |
+| 1.3 Group-commit sequencer | 10k writers + kill -9 → 0 gaps/dupes; publish throughput | ✅ | `internal/sequencer`; `bin/stress -n 10000 -spawn ./bin/api -kill-at 0.4`. **Throughput (M-series laptop, local PG 18): 6,337 events/s with group commit vs 2,381 without (2.7×)**; with kill -9 at 40% and 75%: 1,024 in-flight requests retried, 10,001 rows, 0 gaps, 0 dupes |
+| 1.4 Hostile input | 30 min fuzz with no panic; S6 | ✅ | `FuzzParse` + `FuzzValidateEnvelope`, 30 min each, no crash. **The fuzzer found a real bug in the first seconds:** floats like `1e20` canonicalize to digit strings that re-parse as unsafe integers, which would cause false tamper alarms after a jsonb round-trip. Fixed in Go + TS + spec + vectors. `TestS6HostileVectorsOverHTTP` (126 exact codes), `TestValidVectorsRoundTripThroughPostgres` |
+| 2.1 SDK signs + payload_hash | cross-language vectors pass | ✅ | `@audittrail/sdk` v2 (`at2_` keys, UUIDv7, WebCrypto Ed25519 signing, client-side validation with the shared validator); `scripts/e2e-sdk-v2-smoke.mjs` against the real API |
+| 2.2 Spool + backoff + fail-open | 1 h offline → every event once, in order | ✅ | `scripts/chaos-sdk-offline.mjs` on a FileSpool: 1 min online under chaos, **60 min fully offline** (360 events spooled), then back online under chaos (57 responses dropped after commit, 49 duplicated requests, 16 injected 503s, 813 SDK retries). **430/430 events in the ledger, exactly once, in recording order**; duplicates rejected as nonce replays; 0 errors surfaced to the host app |
+| 2.3 Redaction before hashing | C4: planted keys never reach the wire | ✅ | `src/redact.ts`; `sdk-v2.test.ts` "C4" plants 10 credential types (AWS, GitHub, OpenAI, Anthropic, Stripe, JWT, PEM, AuditTrail, URL password, PII) — none on the wire |
+| 3.1 RFC 9162 + C2SP checkpoints | proofs match external RFC 6962 vectors | ✅ | `internal/merkle` (inclusion + consistency) byte-equal to transparency-dev/merkle for every size ≤ 70 and the RFC 6962 root vectors; `internal/tlog` signed notes interoperate with `golang.org/x/mod/sumdb/note` |
+| 3.2 Witnesses + anchors | A6: two histories → split view rejected | ✅ | `cmd/witness` (C2SP tlog-witness add-checkpoint, cosignature/v1) + tree-head worker; live: 3 witnesses cosigned heads 6 → 27 via consistency proof, plus a FreeTSA anchor. `TestA6SplitView`: witnesses refuse the fork and keep it as evidence, B lacks quorum, and holding both views proves the fork |
+| 3.3 Offline verifier (CLI + WASM) | no network, no trust in our servers | ✅ | `bin/verify` (v2 flags `--log-key --witness --quorum --max-age`) and `apps/dashboard/public/verifier/verify.wasm`; `scripts/wasm-verify-offline.mjs` traps every network API: none touched, genuine bundle passes, tampered one fails naming seq 4 |
+| 3.4 Tamper suite A1–A7 | each failure names the invariant | ✅ | `internal/verify2/tamper_test.go`: A1 content-hash / payload-hash / tree-root (stolen key), A2 seq-continuity, A3 chain-link, A4 coverage + freshness, A5 freshness + consistency, A6 witness-quorum + fork, A7 checkpoint-signature + key-authorization |
+| 4.1 Transparent proxy | zero behavior change vs a real MCP server | ✅ | `packages/mcp-sidecar/test/conformance.mjs`: the same raw JSON-RPC stream (incl. errors, unknown tools/methods, injection text, ANSI, unicode) sent directly and through the proxy → **13/13 responses byte-identical**, 0 extra lines. `test/e2e.mjs` (stdio + Streamable HTTP, sampling/elicitation) verifies offline with the pinned log key |
+| 4.2 Tool pinning | M3 | ✅ | SHA-256(JCS(tool definition)) pinned per server; changed/added/removed tools → `mcp.tool/definition_changed` / `added` / `removed`; `--on-drift block` refuses calls to drifted tools (`mirror.test.ts` M3) |
+| 4.3 Inert tool text | M1 | ✅ | `mirror.test.ts` M1 + conformance: injection payloads are forwarded byte-for-byte, recorded as data, and trigger nothing |
+| 4.4 Heartbeats + gap alerts | M4 | ✅ | every sidecar event carries `{sidecar:{id,seq}}`, plus started/heartbeat/stopped events; the API monitor seals `audittrail.monitor/sidecar_silent` / `sidecar_gap`. `test/m4-sidecar-gap.mjs`: the SIGKILLed sidecar is flagged, the cleanly stopped one is not. **Found and fixed two SDK bugs here:** `flush()` could miss events handed to `track()` just before it (lost last events at shutdown), and concurrent `record()` calls could be spooled out of call order |
+| 4.5 Secret scanning + encrypted raw | M2 | ✅ | args and results scanned with the SDK secret patterns; the ledger keeps redacted copies + SHA-256 + findings; raw args/results go as crypto-shreddable PII (subject = principal). `test/m2-secrets.mjs`: 4 planted secrets detected; a raw SQL dump of every ledger row contains none of them; the raw copy is recoverable only via `pii:read` |
+| 5.1 Crypto-shredding | — | ✅ | `migrations/006`, `internal/pii`: per-(tenant, subject) DEK wrapped by the KEK; AES-256-GCM per field with AAD `tenant\|subject\|field\|event_id`; the record hash covers the ciphertext |
+| 5.2 ERASURE event | plaintext unrecoverable; chain/proofs/verifier still pass | ✅ | `POST /v2/subjects/{s}/erase` (signed, `subjects:erase`) destroys the DEKs and seals `audittrail.subject/erased` with only a subject digest. `TestCryptoShredding`: no plaintext in any stored row, 410 after erasure, the other subject is unaffected, the offline verifier passes, and new events get a fresh key. Legal caveat documented in THREAT_MODEL.md |
+| 6.1 Dashboard CSP + escaping | D1 XSS corpus inert; ZAP clean | ✅ (ZAP: CI) | Per-request nonce CSP (`strict-dynamic`, `wasm-unsafe-eval` only for the verifier, no `unsafe-inline` scripts or styles) + hardening headers in `src/proxy.ts`; no `dangerouslySetInnerHTML`. `scripts/xss-corpus.mjs`: 15 payloads in every attacker-controlled field (incl. tenant name) × 7 pages in real Chrome → **0 canary hits**; DOM check: payloads present only as escaped text. **Removed sonner** (it injects `<style>` without a nonce, which the CSP blocked). OWASP ZAP baseline: `.github/workflows/dast.yml` (needs Docker, so CI only) |
+| 6.2 Evidence export | reviewer matches each field to a clause | ✅ | EU AI Act template updated for the Digital Omnibus timeline (Annex III 2 Dec 2027, Annex I 2 Aug 2028) and v2 fields (received_at, tree head + witness cosignatures, encrypted PII); the PDF now includes the witnessed C2SP tree heads + checkpoint note |
+| 6.3 OTLP gen_ai receiver | fixtures from two SDKs normalize to the same event | ✅ | `internal/otel` + `POST /v1/traces` (JSON + protobuf, `otlp:write` scope). Fixtures produced by **OpenTelemetry JS 2.11 (OTLP/JSON)** and **OpenTelemetry Python 1.45 (OTLP/protobuf)** (`internal/otel/testdata/gen-*.{mjs,py}`) → byte-identical envelopes (`TestTwoSDKsNormalizeToTheSameEvents`). Adapter pins semconv 1.36 (gen_ai.system) vs 1.37+ (gen_ai.provider.name); content attributes are never copied; deterministic UUIDv7 ids, so re-exports are idempotent (verified live: JS, then Python, then JS again → 3 events) |
+| — WASM verifier in the dashboard | runs in real Chrome under strict CSP | ✅ | Event sheet "Verify in this browser" and `/verify` bundle tab use the Go verifier compiled to WASM with the pinned log key; `scripts/browser-verify-e2e.mjs` drives Chrome via DevTools: all invariants pass, 0 CSP errors |
+| 7.1 ASVS L2 self-assessment + fixes | no open High findings | ✅ (pentest: you) | `docs/ASVS-L2.md`, chapter by chapter. Fixed: **dashboard served admin pages with no auth when `DASHBOARD_PASSWORD` was unset** (now fails closed in production, constant-time compare), full HTTP server timeouts + header cap on API and witness. Remaining gaps are deployment items (KMS, SSO/MFA, TLS, shared limiter) |
+| 7.2 Load + chaos | publish p95/p99; 0 lost across a DB restart | ✅ | `tests/load/ingest.js` (k6, 64 VUs, pre-signed via `bin/loadgen`): **4,783 req/s, p95 15.6 ms, p99 24.8 ms, 0 lost**. Postgres restarted mid-run: 64 requests retried, **0 lost**, 20,001 rows verified offline. `docs/PERFORMANCE.md` |
+| 7.3 Supply-chain release | provenance, signatures, SBOM, frozen lockfile | ✅ (first release: you) | `.github/workflows/release.yml`: CI must pass, npm `--provenance`, cross-built binaries + WASM, SLSA build attestations, cosign keyless signatures, CycloneDX SBOMs; `docs/RELEASING.md` |
+| 7.4 Validation kit | interview script + scoring | ✅ (calls: you) | `docs/VALIDATION.md` |
+| — Final regression | everything green | ✅ | Found and fixed during the final pass: **tree heads claimed witnesses without carrying their cosignatures** when the configured witness names differed from key names (High; regression test fails on the old code), and `/v2/export` returned 500 for a log with a deleted row (now exports; verifier names the gap). `tamper-demo.sh`, `retention-demo.sh`, `e2e-sdk-network.mjs` ported to v2; `dev.sh` starts 3 witnesses. `go vet` clean; `go test -race ./...` all packages; TS: core 12, sdk 8, sidecar 10; `scripts/security.sh` baseline; XSS corpus + browser WASM verify rerun behind dashboard auth |

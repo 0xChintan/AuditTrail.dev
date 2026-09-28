@@ -14,23 +14,31 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/time/rate"
 
+	"audittrail.dev/packages/ingestion-go/internal/contract"
+	"audittrail.dev/packages/ingestion-go/internal/db"
 	"audittrail.dev/packages/ingestion-go/internal/keys"
 	"audittrail.dev/packages/ingestion-go/internal/ledger"
+	"audittrail.dev/packages/ingestion-go/internal/pii"
+	"audittrail.dev/packages/ingestion-go/internal/sequencer"
 	"audittrail.dev/packages/ingestion-go/internal/tenant"
 )
 
-const maxBody = 256 << 10
+const maxAdminBody = 64 << 10
 
 type Server struct {
-	Pool        *pgxpool.Pool
-	Sealer      *ledger.Sealer
+	PII         *pii.Encrypter
+	Pool        *pgxpool.Pool // app role (RLS)
+	Control     *pgxpool.Pool // control-plane role
+	Seq         *sequencer.Sequencer
 	Tenants     *tenant.Store
 	AdminToken  string
 	CORSOrigins []string
 	Log         *slog.Logger
+	Now         func() time.Time
 
 	limMu    sync.Mutex
 	limiters map[string]*rate.Limiter
@@ -38,17 +46,21 @@ type Server struct {
 	mux *http.ServeMux
 }
 
-func New(pool *pgxpool.Pool, master *keys.MasterKey, adminToken string, cors []string, log *slog.Logger) *Server {
+func New(pool, control *pgxpool.Pool, master *keys.MasterKey, pepper keys.Pepper, adminToken string, cors []string, log *slog.Logger) *Server {
 	s := &Server{
+		PII:         &pii.Encrypter{KEK: master},
 		Pool:        pool,
-		Sealer:      ledger.NewSealer(pool, master),
-		Tenants:     &tenant.Store{Pool: pool, Master: master},
+		Control:     control,
+		Seq:         sequencer.New(pool, master),
+		Tenants:     &tenant.Store{Pool: pool, Control: control, Master: master, Pepper: pepper},
 		AdminToken:  adminToken,
 		CORSOrigins: cors,
 		Log:         log,
+		Now:         time.Now,
 		limiters:    map[string]*rate.Limiter{},
 		mux:         http.NewServeMux(),
 	}
+	s.Seq.PII = s.PII
 	s.routes()
 	return s
 }
@@ -57,23 +69,29 @@ func (s *Server) routes() {
 	m := s.mux
 	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := s.Pool.Ping(r.Context()); err != nil {
-			writeErr(w, 503, "db_unavailable", err.Error())
+			writeErr(w, 503, "db_unavailable", "database unavailable")
 			return
 		}
 		writeJSON(w, 200, map[string]any{"ok": true})
 	})
-	// Public: verification must not require trusting a session with us.
+	// Public: verification must not require an account with us.
 	m.HandleFunc("GET /v1/tenants/{id}/public-keys", s.handlePublicKeys)
 
-	// Tenant-scoped (API key, or admin token + X-AuditTrail-Tenant).
-	m.Handle("POST /v1/events", s.tenantAuth(s.rateLimited(http.HandlerFunc(s.handleSeal))))
-	m.Handle("GET /v1/events", s.tenantAuth(http.HandlerFunc(s.handleListEvents)))
-	m.Handle("GET /v1/events/{id}", s.tenantAuth(http.HandlerFunc(s.handleGetEvent)))
-	m.Handle("GET /v1/chain/head", s.tenantAuth(http.HandlerFunc(s.handleHead)))
-	m.Handle("GET /v1/stats", s.tenantAuth(http.HandlerFunc(s.handleStats)))
-	m.Handle("GET /v1/me", s.tenantAuth(http.HandlerFunc(s.handleMe)))
+	// v2 ingest: signed requests only.
+	m.Handle("POST /v2/events", s.auth("events:write", true, s.handleIngest))
+	m.Handle("POST /v2/subjects/{subject}/erase", s.auth("subjects:erase", true, s.handleErase))
+	m.Handle("GET /v2/events/{id}/pii", s.auth("pii:read", false, s.handlePIIRead))
+	// v1 ingest is retired: the server is the only sequencer.
+	m.HandleFunc("POST /v1/events", func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, 410, "gone", "POST /v1/events is retired; use POST /v2/events (spec_version 2, signed requests)")
+	})
 
-	// Admin.
+	m.Handle("GET /v1/events", s.auth("events:read", false, s.handleListEvents))
+	m.Handle("GET /v1/events/{id}", s.auth("events:read", false, s.handleGetEvent))
+	m.Handle("GET /v1/chain/head", s.auth("events:read", false, s.handleHead))
+	m.Handle("GET /v1/stats", s.auth("events:read", false, s.handleStats))
+	m.Handle("GET /v1/me", s.auth("", false, s.handleMe))
+
 	m.Handle("GET /v1/admin/tenants", s.adminAuth(http.HandlerFunc(s.handleListTenants)))
 	m.Handle("POST /v1/admin/tenants", s.adminAuth(http.HandlerFunc(s.handleCreateTenant)))
 	m.Handle("GET /v1/admin/tenants/{id}", s.adminAuth(http.HandlerFunc(s.handleGetTenant)))
@@ -84,27 +102,32 @@ func (s *Server) routes() {
 	m.Handle("POST /v1/admin/tenants/{id}/signing-keys/rotate", s.adminAuth(http.HandlerFunc(s.handleRotateKey)))
 }
 
-// Handle lets later phases register extra routes (checkpoints, exports).
+// Handle lets later phases register extra routes.
 func (s *Server) Handle(pattern string, h http.Handler) { s.mux.Handle(pattern, h) }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
+	h := w.Header()
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Cache-Control", "no-store")
 	if origin := r.Header.Get("Origin"); origin != "" && s.corsAllowed(origin) {
-		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", origin)
 		h.Set("Vary", "Origin")
-		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-AuditTrail-Tenant")
+		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-AuditTrail-Tenant, X-AT-Timestamp, X-AT-Nonce, X-AT-Signature")
 		h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(204)
 			return
 		}
 	}
-	sw := &statusWriter{ResponseWriter: w, status: 200}
-	s.mux.ServeHTTP(sw, r)
-	if s.Log != nil && r.URL.Path != "/healthz" {
-		s.Log.Debug("http", "method", r.Method, "path", r.URL.Path, "status", sw.status, "dur_ms", time.Since(start).Milliseconds())
-	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			if s.Log != nil {
+				s.Log.Error("panic", "err", rec, "path", r.URL.Path)
+			}
+			writeErr(w, 500, "internal", "internal error")
+		}
+	}()
+	s.mux.ServeHTTP(w, r)
 }
 
 func (s *Server) corsAllowed(origin string) bool {
@@ -116,27 +139,19 @@ func (s *Server) corsAllowed(origin string) bool {
 	return false
 }
 
-type statusWriter struct {
-	http.ResponseWriter
-	status int
+// ---- auth -----------------------------------------------------------------------
+
+// Auth is the resolved caller of a tenant route.
+type Auth struct {
+	Tenant tenant.Tenant
+	Cred   *tenant.Credential // nil for admin-as-tenant
+	Body   []byte             // signed routes: the verified body
 }
 
-func (w *statusWriter) WriteHeader(c int) { w.status = c; w.ResponseWriter.WriteHeader(c) }
-
-// ---- auth -----------------------------------------------------------------
-
-type ctxKey int
-
-const tenantKey ctxKey = 1
-
-func TenantFrom(ctx context.Context) tenant.Tenant {
-	t, _ := ctx.Value(tenantKey).(tenant.Tenant)
-	return t
-}
+type authed func(w http.ResponseWriter, r *http.Request, a *Auth)
 
 func bearer(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if v, ok := strings.CutPrefix(h, "Bearer "); ok {
+	if v, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok {
 		return strings.TrimSpace(v)
 	}
 	return ""
@@ -146,43 +161,125 @@ func (s *Server) isAdmin(r *http.Request) bool {
 	return s.AdminToken != "" && keys.HashesEqual(bearer(r), s.AdminToken)
 }
 
-func (s *Server) tenantAuth(next http.Handler) http.Handler {
+func (s *Server) unauthorized(w http.ResponseWriter, why string) {
+	// One generic answer for every failure; the reason is only logged.
+	if s.Log != nil {
+		s.Log.Info("auth rejected", "reason", why)
+	}
+	writeErr(w, 401, "unauthorized", "authentication failed")
+}
+
+// auth resolves the tenant from an API key (or the admin token + tenant
+// header for read routes), checks the scope, and for signed routes verifies
+// the request signature and burns its nonce.
+func (s *Server) auth(scope string, signed bool, next authed) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var t tenant.Tenant
-		var err error
-		if s.isAdmin(r) {
-			id := r.Header.Get("X-AuditTrail-Tenant")
-			if id == "" {
+		ctx := r.Context()
+		a := &Auth{}
+		var tenantID string
+		if s.isAdmin(r) && !signed {
+			tenantID = r.Header.Get("X-AuditTrail-Tenant")
+			if !isUUID(tenantID) {
 				writeErr(w, 400, "tenant_required", "admin requests to tenant routes need X-AuditTrail-Tenant")
 				return
 			}
-			t, err = s.Tenants.Get(r.Context(), id)
 		} else {
-			t, _, err = s.Tenants.Authenticate(r.Context(), bearer(r))
+			cred, err := s.Tenants.Authenticate(ctx, bearer(r))
+			if err != nil {
+				s.unauthorized(w, "bad_or_revoked_or_expired_key")
+				return
+			}
+			if scope != "" && !cred.Has(scope) {
+				writeErr(w, 403, "forbidden", "API key lacks scope "+scope)
+				return
+			}
+			a.Cred, tenantID = &cred, cred.TenantID
 		}
+		if signed {
+			if a.Cred == nil || a.Cred.Version != 2 || a.Cred.SignPub == nil {
+				s.unauthorized(w, "unsigned_credential")
+				return
+			}
+			body, err := io.ReadAll(io.LimitReader(r.Body, contract.MaxBodyBytes+1))
+			if err != nil {
+				writeErr(w, 400, "bad_request", "could not read body")
+				return
+			}
+			if len(body) > contract.MaxBodyBytes {
+				writeErr(w, 413, "body_too_large", fmt.Sprintf("body exceeds %d bytes", contract.MaxBodyBytes))
+				return
+			}
+			ts, nonce, sig := r.Header.Get("X-AT-Timestamp"), r.Header.Get("X-AT-Nonce"), r.Header.Get("X-AT-Signature")
+			if ok, why := contract.VerifyRequest(a.Cred.SignPub, r.Method, r.URL.EscapedPath(), ts, nonce, sig, body, s.Now()); !ok {
+				s.unauthorized(w, why)
+				return
+			}
+			ct, err := s.Pool.Exec(ctx, `INSERT INTO request_nonces (key_id, nonce, expires_at)
+				VALUES ($1, $2, NOW() + interval '15 minutes') ON CONFLICT DO NOTHING`, a.Cred.KeyID, nonce)
+			if err != nil {
+				s.internal(w, err)
+				return
+			}
+			if ct.RowsAffected() == 0 {
+				s.unauthorized(w, "nonce_replayed")
+				return
+			}
+			a.Body = body
+		}
+		err := db.InTenant(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
+			t, err := tenant.GetTx(ctx, tx, tenantID)
+			if err != nil {
+				return err
+			}
+			a.Tenant = t
+			if a.Cred != nil {
+				tenant.Touch(ctx, tx, a.Cred.KeyID)
+			}
+			return nil
+		})
 		if err != nil {
-			writeErr(w, 401, "unauthorized", "missing, invalid or revoked API key")
+			s.unauthorized(w, "tenant_not_found")
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), tenantKey, t)))
+		next(w, r, a)
 	})
 }
 
 func (s *Server) adminAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.isAdmin(r) {
-			writeErr(w, 401, "unauthorized", "admin token required")
+			s.unauthorized(w, "admin_token")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// ---- rate limiting (Task 2.3): per-tenant token bucket, in memory ----------
+// tx runs fn in a transaction scoped to the caller's tenant (RLS).
+func (s *Server) tx(r *http.Request, a *Auth, fn func(pgx.Tx) error) error {
+	return db.InTenant(r.Context(), s.Pool, a.Tenant.ID, fn)
+}
 
-func (s *Server) limiter(t tenant.Tenant) *rate.Limiter {
+// StartNonceJanitor deletes expired nonces periodically.
+func (s *Server) StartNonceJanitor(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				_, _ = s.Pool.Exec(ctx, `DELETE FROM request_nonces WHERE expires_at < NOW()`)
+			}
+		}
+	}()
+}
+
+// ---- rate limiting: per-tenant token bucket --------------------------------------
+
+func (s *Server) limited(w http.ResponseWriter, t tenant.Tenant) bool {
 	s.limMu.Lock()
-	defer s.limMu.Unlock()
 	l, ok := s.limiters[t.ID]
 	if !ok {
 		l = rate.NewLimiter(rate.Limit(t.RateLimitRPS), t.RateLimitBurst)
@@ -191,49 +288,36 @@ func (s *Server) limiter(t tenant.Tenant) *rate.Limiter {
 		l.SetLimit(rate.Limit(t.RateLimitRPS))
 		l.SetBurst(t.RateLimitBurst)
 	}
-	return l
+	s.limMu.Unlock()
+	res := l.Reserve()
+	if d := res.Delay(); d > 0 {
+		res.Cancel()
+		w.Header().Set("Retry-After", strconv.Itoa(int(d.Seconds())+1))
+		writeErr(w, 429, "rate_limited", "tenant rate limit exceeded")
+		return true
+	}
+	return false
 }
 
-func (s *Server) rateLimited(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t := TenantFrom(r.Context())
-		res := s.limiter(t).Reserve()
-		if d := res.Delay(); d > 0 {
-			res.Cancel()
-			secs := int(d.Seconds()) + 1
-			w.Header().Set("Retry-After", strconv.Itoa(secs))
-			writeErr(w, 429, "rate_limited", fmt.Sprintf("tenant rate limit exceeded (%d rps, burst %d)", t.RateLimitRPS, t.RateLimitBurst))
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// ---- helpers --------------------------------------------------------------
+// ---- helpers ---------------------------------------------------------------------
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
+	enc.SetEscapeHTML(true)
 	_ = enc.Encode(v)
 }
 
-func writeErr(w http.ResponseWriter, status int, code, msg string, extra ...map[string]any) {
-	e := map[string]any{"code": code, "message": msg}
-	for _, x := range extra {
-		for k, v := range x {
-			e[k] = v
-		}
-	}
-	writeJSON(w, status, map[string]any{"error": e})
+func writeErr(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]any{"error": map[string]any{"code": code, "message": msg}})
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAdminBody))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		writeErr(w, 400, "invalid_json", err.Error())
+		writeErr(w, 400, "invalid_json", "request body is not valid JSON for this endpoint")
 		return false
 	}
 	if dec.More() {
@@ -250,32 +334,44 @@ func (s *Server) internal(w http.ResponseWriter, err error) {
 	writeErr(w, 500, "internal", "internal error")
 }
 
-// ---- tenant handlers ------------------------------------------------------
+// ---- v2 ingest ---------------------------------------------------------------------
 
-func (s *Server) handleSeal(w http.ResponseWriter, r *http.Request) {
-	var sub ledger.Submission
-	if !decode(w, r, &sub) {
+func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request, a *Auth) {
+	if s.limited(w, a.Tenant) {
 		return
 	}
-	t := TenantFrom(r.Context())
-	rec, replay, err := s.Sealer.Seal(r.Context(), t.ID, sub)
-	var ve *ledger.ValidationError
-	var ce *ledger.ConflictError
+	env, cerr := contract.ValidateEnvelope(a.Body)
+	if cerr != nil {
+		writeErr(w, cerr.Status, cerr.Code, cerr.Msg)
+		return
+	}
+	rec, replay, err := s.Seq.Submit(r.Context(), a.Tenant.ID, env)
 	switch {
-	case err == nil && replay:
-		w.Header().Set("Idempotent-Replay", "true")
-		writeJSON(w, 200, rec)
-	case err == nil:
-		writeJSON(w, 201, rec)
-	case errors.As(err, &ve):
-		writeErr(w, 400, "validation_failed", ve.Msg)
-	case errors.As(err, &ce):
-		writeErr(w, 409, ce.Code, ce.Msg, map[string]any{
-			"current_head": ce.CurrentHead, "current_seq": ce.CurrentSeq, "expected_hash": ce.Expected})
-	default:
+	case errors.Is(err, sequencer.ErrConflict):
+		writeErr(w, 409, "idempotency_conflict", "event_id was already used with a different body")
+	case errors.Is(err, sequencer.ErrPIIDisabled):
+		writeErr(w, 422, "pii_unsupported", "PII encryption is not enabled on this server")
+	case err != nil:
 		s.internal(w, err)
+	case replay:
+		writeJSON(w, 200, rec)
+	default:
+		writeJSON(w, 202, rec)
 	}
 }
+
+// Record seals a server-generated event (admin changes, monitor alerts).
+func (s *Server) Record(ctx context.Context, tenantID, agentID, action, resource, outcome string, principal *contract.Value, payload any) {
+	env, err := sequencer.Internal(s.Now(), agentID, action, resource, outcome, principal, payload)
+	if err == nil {
+		_, _, err = s.Seq.Submit(ctx, tenantID, env)
+	}
+	if err != nil && s.Log != nil {
+		s.Log.Error("internal event not recorded", "err", err, "action", action)
+	}
+}
+
+// ---- tenant reads --------------------------------------------------------------------
 
 func parseFilter(r *http.Request) (ledger.Filter, error) {
 	q := r.URL.Query()
@@ -311,79 +407,117 @@ func parseFilter(r *http.Request) (ledger.Filter, error) {
 	return f, err
 }
 
-func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request, a *Auth) {
 	f, err := parseFilter(r)
 	if err != nil {
 		writeErr(w, 400, "bad_query", err.Error())
 		return
 	}
-	evs, err := ledger.ListEvents(r.Context(), s.Pool, TenantFrom(r.Context()).ID, f)
-	if err != nil {
+	var evs []ledger.Record
+	if err := s.tx(r, a, func(tx pgx.Tx) error {
+		evs, err = ledger.ListEvents(r.Context(), tx, a.Tenant.ID, f)
+		return err
+	}); err != nil {
 		s.internal(w, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"events": evs})
 }
 
-func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
-	rec, err := ledger.GetEvent(r.Context(), s.Pool, TenantFrom(r.Context()).ID, r.PathValue("id"))
+func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request, a *Auth) {
+	id := r.PathValue("id")
+	if !isUUID(id) {
+		writeErr(w, 404, "not_found", "event not found")
+		return
+	}
+	var rec ledger.Record
+	err := s.tx(r, a, func(tx pgx.Tx) error {
+		var e error
+		rec, e = ledger.GetEvent(r.Context(), tx, a.Tenant.ID, id)
+		return e
+	})
 	if errors.Is(err, ledger.ErrNotFound) {
 		writeErr(w, 404, "not_found", "event not found")
 		return
 	}
 	if err != nil {
-		writeErr(w, 400, "bad_request", "invalid event id")
+		s.internal(w, err)
 		return
 	}
 	writeJSON(w, 200, rec)
 }
 
-func (s *Server) handleHead(w http.ResponseWriter, r *http.Request) {
-	t := TenantFrom(r.Context())
-	h, seq, err := ledger.Head(r.Context(), s.Pool, t.ID)
-	if err != nil {
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+		} else if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, a *Auth) {
+	var h string
+	var seq int64
+	if err := s.tx(r, a, func(tx pgx.Tx) error {
+		var e error
+		h, seq, e = ledger.Head(r.Context(), tx, a.Tenant.ID)
+		return e
+	}); err != nil {
 		s.internal(w, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"tenant_id": t.ID, "seq": seq, "hash": h})
+	writeJSON(w, 200, map[string]any{"tenant_id": a.Tenant.ID, "seq": seq, "hash": h})
 }
 
-func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	st, err := ledger.GetStats(r.Context(), s.Pool, TenantFrom(r.Context()).ID)
-	if err != nil {
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, a *Auth) {
+	var st ledger.Stats
+	if err := s.tx(r, a, func(tx pgx.Tx) error {
+		var e error
+		st, e = ledger.GetStats(r.Context(), tx, a.Tenant.ID)
+		return e
+	}); err != nil {
 		s.internal(w, err)
 		return
 	}
 	writeJSON(w, 200, st)
 }
 
-func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, TenantFrom(r.Context()))
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, a *Auth) {
+	out := map[string]any{"tenant": a.Tenant}
+	if a.Cred != nil {
+		out["key"] = map[string]any{"id": a.Cred.KeyID, "version": a.Cred.Version, "scopes": a.Cred.Scopes}
+	}
+	writeJSON(w, 200, out)
 }
 
 func (s *Server) handlePublicKeys(w http.ResponseWriter, r *http.Request) {
-	ks, err := s.Tenants.PublicKeys(r.Context(), r.PathValue("id"))
-	if err != nil {
+	id := r.PathValue("id")
+	if !isUUID(id) {
 		writeErr(w, 404, "not_found", "tenant not found")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"tenant_id": r.PathValue("id"), "keys": ks})
+	ks, err := s.Tenants.PublicKeys(r.Context(), id)
+	if err != nil || len(ks) == 0 {
+		writeErr(w, 404, "not_found", "tenant not found")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"tenant_id": id, "keys": ks})
 }
 
-// ---- admin handlers -------------------------------------------------------
+// ---- admin (control plane) --------------------------------------------------------------
 
-// adminEvent records an administrative change in the tenant's own ledger, so
-// retention / legal-hold / key changes are themselves tamper-evident.
+var adminPrincipal = contract.MustFromGo(map[string]string{"id": "admin-token", "type": "service"})
+
 func (s *Server) adminEvent(ctx context.Context, tenantID, action, target string, meta map[string]any) {
-	md, _ := json.Marshal(meta)
-	actor := "admin-token"
-	_, _, err := s.Sealer.Seal(ctx, tenantID, ledger.Submission{
-		HumanPrincipalID: &actor, AgentID: "audittrail-admin", Action: action, TargetResource: target,
-		Outcome: "allowed", Metadata: md,
-	})
-	if err != nil && s.Log != nil {
-		s.Log.Error("admin event not recorded", "err", err, "action", action)
-	}
+	s.Record(ctx, tenantID, "audittrail-admin", action, target, "allowed", adminPrincipal, meta)
 }
 
 func (s *Server) handleListTenants(w http.ResponseWriter, r *http.Request) {
@@ -405,8 +539,8 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &body) {
 		return
 	}
-	if strings.TrimSpace(body.Name) == "" {
-		writeErr(w, 400, "validation_failed", "name is required")
+	if strings.TrimSpace(body.Name) == "" || len(body.Name) > 200 {
+		writeErr(w, 400, "validation_failed", "name is required (max 200 chars)")
 		return
 	}
 	if body.RetentionDays != 0 && body.RetentionDays < 183 {
@@ -471,7 +605,9 @@ func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name string `json:"name"`
+		Name      string     `json:"name"`
+		Scopes    []string   `json:"scopes"`
+		ExpiresAt *time.Time `json:"expires_at"`
 	}
 	if r.ContentLength != 0 && !decode(w, r, &body) {
 		return
@@ -480,16 +616,20 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		body.Name = "key-" + time.Now().UTC().Format("20060102-150405")
 	}
 	id := r.PathValue("id")
-	full, k, err := s.Tenants.CreateAPIKey(r.Context(), id, body.Name)
+	full, k, err := s.Tenants.CreateAPIKey(r.Context(), id, body.Name, body.Scopes, body.ExpiresAt)
 	if errors.Is(err, tenant.ErrNotFound) {
 		writeErr(w, 404, "not_found", "tenant not found")
+		return
+	}
+	if err != nil && strings.HasPrefix(err.Error(), "unknown scope") {
+		writeErr(w, 400, "validation_failed", err.Error())
 		return
 	}
 	if err != nil {
 		s.internal(w, err)
 		return
 	}
-	s.adminEvent(r.Context(), id, "api_key.created", "api_key:"+k.ID, map[string]any{"name": k.Name, "prefix": k.Prefix})
+	s.adminEvent(r.Context(), id, "api_key.created", "api_key:"+k.ID, map[string]any{"name": k.Name, "prefix": k.Prefix, "scopes": k.Scopes})
 	writeJSON(w, 201, map[string]any{"api_key": full, "api_key_info": k})
 }
 
@@ -514,5 +654,73 @@ func (s *Server) handleRotateKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, pk)
 }
 
-// drain is used by tests to discard bodies.
-var _ = io.Discard
+// ---- crypto-shredding (v2 phase 5) ------------------------------------------------
+
+func (s *Server) handleErase(w http.ResponseWriter, r *http.Request, a *Auth) {
+	subject := r.PathValue("subject")
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if len(a.Body) > 0 {
+		if err := json.Unmarshal(a.Body, &body); err != nil {
+			writeErr(w, 400, "invalid_json", "body must be {\"reason\": \"…\"}")
+			return
+		}
+	}
+	if strings.TrimSpace(body.Reason) == "" || len(body.Reason) > 500 || subject == "" || len(subject) > 256 {
+		writeErr(w, 422, "invalid_value", "a subject and a reason (1..500 chars) are required")
+		return
+	}
+	var dekIDs []string
+	if err := s.tx(r, a, func(tx pgx.Tx) error {
+		var e error
+		dekIDs, e = pii.Erase(r.Context(), tx, a.Tenant.ID, subject, body.Reason)
+		return e
+	}); err != nil {
+		s.internal(w, err)
+		return
+	}
+	digest := pii.SubjectDigest(a.Tenant.ID, subject)
+	principal := contract.MustFromGo(map[string]string{"id": "api-key:" + a.Cred.KeyID, "type": "service"})
+	env, err := sequencer.Internal(s.Now(), "audittrail-erasure", "audittrail.subject/erased", "subject:"+digest, "allowed", principal,
+		map[string]any{"subject_sha256": digest, "destroyed_keys": dekIDs, "reason": body.Reason})
+	var rec sequencer.Receipt
+	if err == nil {
+		rec, _, err = s.Seq.Submit(r.Context(), a.Tenant.ID, env)
+	}
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"subject_sha256": digest, "destroyed_keys": dekIDs, "erasure_event": rec})
+}
+
+func (s *Server) handlePIIRead(w http.ResponseWriter, r *http.Request, a *Auth) {
+	id := r.PathValue("id")
+	if !isUUID(id) {
+		writeErr(w, 404, "not_found", "event not found")
+		return
+	}
+	var fields map[string]string
+	err := s.tx(r, a, func(tx pgx.Tx) error {
+		rec, e := ledger.GetEvent(r.Context(), tx, a.Tenant.ID, id)
+		if e != nil {
+			return e
+		}
+		if len(rec.PIICT) == 0 {
+			return ledger.ErrNotFound
+		}
+		fields, e = s.PII.Decrypt(r.Context(), tx, a.Tenant.ID, id, rec.PIICT)
+		return e
+	})
+	switch {
+	case errors.Is(err, ledger.ErrNotFound):
+		writeErr(w, 404, "not_found", "no PII on this event")
+	case errors.Is(err, pii.ErrErased):
+		writeErr(w, 410, "erased", "this subject's data has been crypto-shredded")
+	case err != nil:
+		s.internal(w, err)
+	default:
+		writeJSON(w, 200, map[string]any{"event_id": id, "fields": fields})
+	}
+}

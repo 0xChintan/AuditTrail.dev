@@ -30,9 +30,10 @@ func main() {
 		log.Printf("dropped database")
 	}
 	pw := db.RolePasswords{
-		App:    config.Str("AUDITTRAIL_APP_DB_PASSWORD", "audittrail_app"),
-		Worker: config.Str("AUDITTRAIL_WORKER_DB_PASSWORD", "audittrail_worker"),
-		Purge:  config.Str("AUDITTRAIL_PURGE_DB_PASSWORD", "audittrail_purge"),
+		App:     config.Str("AUDITTRAIL_APP_DB_PASSWORD", "audittrail_app"),
+		Worker:  config.Str("AUDITTRAIL_WORKER_DB_PASSWORD", "audittrail_worker"),
+		Purge:   config.Str("AUDITTRAIL_PURGE_DB_PASSWORD", "audittrail_purge"),
+		Control: config.Str("AUDITTRAIL_CONTROL_DB_PASSWORD", "audittrail_control"),
 	}
 	if err := db.Migrate(ctx, admin, pw, log.Printf); err != nil {
 		log.Fatalf("migrate: %v", err)

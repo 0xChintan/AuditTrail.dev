@@ -1,0 +1,2 @@
+10038	IGNORE	(CSP header not set: only for non-HTML API responses, which carry nosniff + no-store)
+10049	IGNORE	(Non-storable content: intended, API responses are Cache-Control: no-store)

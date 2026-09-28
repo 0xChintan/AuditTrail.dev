@@ -5,8 +5,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"audittrail.dev/packages/ingestion-go/internal/ledger"
 	"audittrail.dev/packages/ingestion-go/internal/tenant"
 	"audittrail.dev/packages/ingestion-go/internal/verify"
@@ -25,7 +23,7 @@ const MaxBundleRows = 250_000
 // boundaries so every covering Merkle root can be recomputed, plus the
 // checkpoint that ends just before the first row (the chain-start anchor
 // when earlier rows are out of range or purged), and all public keys.
-func BuildBundle(ctx context.Context, pool *pgxpool.Pool, t tenant.Tenant, pubs []tenant.PublicKey, r Range) (verify.Bundle, error) {
+func BuildBundle(ctx context.Context, pool ledger.Querier, t tenant.Tenant, pubs []tenant.PublicKey, r Range) (verify.Bundle, error) {
 	b := verify.Bundle{Format: verify.BundleFormat, GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		Tenant: verify.BundleTenant{ID: t.ID, Name: t.Name, RetentionDays: t.RetentionDays, LegalHold: t.LegalHold},
 		Events: []ledger.Record{}, Checkpoints: []ledger.Checkpoint{}}

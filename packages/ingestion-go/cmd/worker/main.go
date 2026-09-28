@@ -20,6 +20,7 @@ import (
 	"audittrail.dev/packages/ingestion-go/internal/config"
 	"audittrail.dev/packages/ingestion-go/internal/db"
 	"audittrail.dev/packages/ingestion-go/internal/keys"
+	"audittrail.dev/packages/ingestion-go/internal/treehead"
 )
 
 func main() {
@@ -46,14 +47,35 @@ func main() {
 	if u := config.Str("TSA_URL", "https://freetsa.org/tsr"); !strings.EqualFold(u, "off") {
 		w.TSA = &anchor.TSA{URL: u}
 	}
+	// v2 tree heads: WITNESSES="name=url,name=url"
+	th := &treehead.Worker{Pool: pool, Master: master, TSA: w.TSA, Log: log}
+	for _, spec := range strings.Split(config.Str("WITNESSES", ""), ",") {
+		if name, url, ok := strings.Cut(strings.TrimSpace(spec), "="); ok {
+			th.Witnesses = append(th.Witnesses, treehead.WitnessCfg{Name: name, URL: url})
+		}
+	}
 	interval := config.Dur("CHECKPOINT_INTERVAL", 2*time.Minute)
 	for {
 		var res checkpoint.Result
 		var err error
 		if *only != "" {
 			res, err = w.RunTenant(ctx, *only)
+			if h, herr := th.Run(ctx, *only); herr != nil {
+				log.Error("tree head", "err", herr)
+				res.Integrity = append(res.Integrity, herr)
+			} else if h != nil {
+				log.Info("tree head", "tenant", *only, "size", h.TreeSize, "witnesses", h.Witnesses, "anchored", h.Anchored)
+			}
 		} else {
 			res, err = w.RunOnce(ctx)
+			heads, errs := th.RunAll(ctx)
+			for _, h := range heads {
+				log.Info("tree head", "tenant", h.TenantID, "size", h.TreeSize, "witnesses", h.Witnesses, "anchored", h.Anchored)
+			}
+			for _, e := range errs {
+				log.Error("tree head", "err", e)
+				res.Integrity = append(res.Integrity, e)
+			}
 		}
 		if err != nil {
 			log.Error("run", "err", err)

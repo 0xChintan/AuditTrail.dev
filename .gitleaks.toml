@@ -1,0 +1,25 @@
+title = "AuditTrail gitleaks config"
+
+[extend]
+useDefault = true
+
+# Our own credential formats: leaking one of these is always a finding.
+[[rules]]
+id = "audittrail-api-key"
+description = "AuditTrail API key"
+regex = '''\bat2?_[0-9a-f]{12}_[A-Za-z0-9_-]{43}\b'''
+keywords = ["at_", "at2_"]
+
+[[rules]]
+id = "audittrail-master-key"
+description = "AuditTrail master key assignment"
+regex = '''AUDITTRAIL_MASTER_KEY\s*=\s*[A-Za-z0-9+/]{43}='''
+keywords = ["AUDITTRAIL_MASTER_KEY"]
+
+[allowlist]
+description = "Deterministic fake keys in published test vectors; build output"
+paths = [
+  '''schemas/v2/vectors\.json$''',
+  '''(^|/)\.next/''',
+  '''(^|/)node_modules/''',
+]

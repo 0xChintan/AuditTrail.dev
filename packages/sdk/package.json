@@ -1,6 +1,6 @@
 {
   "name": "@audittrail/sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Record tamper-evident audit events to AuditTrail.dev. Server-sealed hash chain, ordered offline retry queue, Express/Next.js helpers.",
   "license": "Apache-2.0",
   "type": "module",
@@ -54,20 +54,21 @@
   "devDependencies": {
     "tsup": "^8.5.0",
     "typescript": "^5.9.0",
-    "vitest": "^3.2.0",
+    "vitest": "^4.1.11",
     "@types/node": "^24.0.0"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/audittrail-dev/audittrail.git",
+    "url": "https://github.com/0xChintan/AuditTrail.dev.git",
     "directory": "packages/sdk"
   },
   "homepage": "https://audittrail.dev",
   "bugs": {
-    "url": "https://github.com/audittrail-dev/audittrail/issues"
+    "url": "https://github.com/0xChintan/AuditTrail.dev/issues"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   },
   "engines": {
     "node": ">=20"

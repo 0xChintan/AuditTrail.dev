@@ -2,9 +2,12 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { AuditTrail } from "@audittrail/sdk";
-import { FileQueueStore } from "@audittrail/sdk/node";
-import type { CaptureMode, MirrorOptions } from "./mirror.js";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { AuditTrail, type AuditEvent } from "@audittrail/sdk";
+import { FileSpool } from "@audittrail/sdk/node";
+import type { CaptureMode, MirrorOptions, PinStore } from "./mirror.js";
 import { runHttpProxy, runStdioProxy, runStdioToHttp } from "./transports.js";
 
 const HELP = `audittrail-mcp-proxy — hash-chain every MCP tool call into AuditTrail, with no
@@ -32,6 +35,11 @@ Options:
   --capture-args <mode>   full | redacted (default) | hash | none
   --header "K: V"         Extra header sent to the HTTP upstream (repeatable)
   --audit-all             Record every request method, not only actions
+  --pins <path>           Tool-definition pin file (default ~/.audittrail/pins.json)
+  --on-drift <mode>       warn (default) | block: refuse calls to tools whose definition changed
+  --heartbeat <seconds>   Heartbeat interval so silent gaps are detectable (default 60, 0 = off)
+  --store-raw <mode>      encrypted (default): raw args/results stored encrypted per principal (crypto-shreddable)
+                          none: keep only hashes + secret-redacted copies
   --queue <path>          Durable local queue file (default ~/.audittrail/…)
   --no-os-principal       Don't fall back to the OS user as (inferred) principal
   --quiet                 Only log errors (to stderr)
@@ -93,17 +101,65 @@ async function main() {
     `mcp-proxy-${createHash("sha256").update(apiUrl + "|" + apiKey.slice(0, 15) + "|" + upstreamDesc).digest("hex").slice(0, 16)}.jsonl`);
 
   const audit = new AuditTrail({
-    apiKey, baseUrl: apiUrl, agentId: "unknown",
-    store: new FileQueueStore(queuePath),
+    apiKey, baseUrl: apiUrl, agent: { id: "audittrail-mcp-proxy" },
+    spool: new FileSpool(queuePath),
     onError: (e) => (e.permanent ? log(`audit event rejected: ${e.code} ${e.message}`) : !quiet && log(`audit delivery retrying: ${e.message}`)),
   });
+  // Every event carries this sidecar's id and a gap-free counter; heartbeats
+  // make a killed or bypassed sidecar detectable server-side (threat T11).
+  const sidecarId = randomUUID();
+  let sidecarSeq = 0;
+  const startedAt = Date.now();
+  const recorder = {
+    track(ev: AuditEvent) {
+      const payload = { ...(ev.payload ?? {}), sidecar: { id: sidecarId, seq: ++sidecarSeq } };
+      return audit.track({ ...ev, payload });
+    },
+  };
+  const hbSeconds = Number(o.heartbeat ?? 60);
+  const beat = (action: string, outcome: "allowed" | "error" = "allowed") =>
+    recorder.track({ agent: { id: "audittrail-mcp-proxy" }, principal: null, action, resource: `sidecar:${sidecarId}`, outcome,
+      payload: { upstream: upstreamDesc, heartbeat_seconds: hbSeconds, uptime_s: Math.round((Date.now() - startedAt) / 1000), pid: process.pid } });
+  beat("audittrail.sidecar/started");
+  if (hbSeconds > 0) setInterval(() => beat("audittrail.sidecar/heartbeat"), hbSeconds * 1000).unref();
   const headers: Record<string, string> = {};
   for (const h of o.header as string[]) {
     const i = h.indexOf(":");
     if (i > 0) headers[h.slice(0, i).trim().toLowerCase()] = h.slice(i + 1).trim();
   }
+  const pinPath = (o.pins as string) || join(homedir(), ".audittrail", "pins.json");
+  const pins: PinStore = {
+    get(server) {
+      if (!existsSync(pinPath)) return undefined;
+      try {
+        return (JSON.parse(readFileSync(pinPath, "utf8")) as Record<string, Record<string, string>>)[server];
+      } catch {
+        return undefined;
+      }
+    },
+    set(server, p) {
+      let all: Record<string, Record<string, string>> = {};
+      try {
+        all = JSON.parse(readFileSync(pinPath, "utf8"));
+      } catch {
+        /* new file */
+      }
+      all[server] = p;
+      mkdirSync(dirname(pinPath), { recursive: true, mode: 0o700 });
+      writeFileSync(pinPath + ".tmp", JSON.stringify(all, null, 2), { mode: 0o600 });
+      renameSync(pinPath + ".tmp", pinPath);
+    },
+  };
+  const onDrift = ((o["on-drift"] as string) || "warn") as "warn" | "block";
+  if (onDrift !== "warn" && onDrift !== "block") {
+    log("--on-drift must be warn or block");
+    process.exit(2);
+  }
   const mirror: MirrorOptions = {
-    recorder: audit,
+    recorder,
+    pins,
+    onDrift,
+    storeRaw: ((o["store-raw"] as string) || "encrypted") as "encrypted" | "none",
     upstream: upstreamDesc,
     transport: o.listen || !command.length ? "http" : "stdio",
     serverName: o["server-name"] as string | undefined,
@@ -124,6 +180,7 @@ async function main() {
   const exit = async (code: number) => {
     if (exiting) return;
     exiting = true;
+    beat("audittrail.sidecar/stopped");
     const pending = await audit.pending();
     if (pending > 0) info(`flushing ${pending} audit event(s)…`);
     const ok = await Promise.race([audit.flush().then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), 5000))]);

@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { LockIcon, LockOpenIcon } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from "@/components/at/toast";
 import { updateSettings } from "@/app/actions";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";

@@ -10,3 +10,4 @@ packages/ingestion-go/bin/
 coverage/
 *.log
 .DS_Store
+/build/

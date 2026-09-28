@@ -3,7 +3,7 @@
 // checks each ledger record's identity chain.
 //
 //   node test/e2e.mjs      (needs the API on :8080 and .env with admin token)
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -13,7 +13,6 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CreateMessageRequestSchema, ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { verifyBundle } from "@audittrail/core";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -106,7 +105,16 @@ check(sampling && sampling.delegation_chain.some((f) => f.type === "tool_call" &
 check(sampling?.metadata.sampling_model === "claude-sonnet-5", "model observed from sampling result");
 check(find((e) => e.action === "mcp.elicitation/create")?.outcome === "denied", "declined elicitation recorded as human denial");
 check(mcp.filter((e) => e.action === "mcp.session/initialize").length === 2, "one session/initialize record per session");
-const rep = await verifyBundle({ format: "audittrail.bundle.v1", generated_at: "", tenant: { id: TENANT, name: "" }, public_keys: keys, events, checkpoints: [] });
-check(rep.ok, `whole chain verifies (${rep.eventsChecked} rows, ${rep.signaturesVerified} signatures)`);
+const bundlePath = join(qdir, "bundle.v2.json");
+writeFileSync(bundlePath, await (await fetch(`${API}/v2/export`, { headers: { authorization: `Bearer ${env.AUDITTRAIL_ADMIN_TOKEN}`, "x-audittrail-tenant": TENANT } })).text());
+const logKey = (await (await fetch(`${API}/v2/tenants/${TENANT}/log`)).json()).vkeys[0];
+let verified = false;
+try {
+  execFileSync(join(root, "packages/ingestion-go/bin/verify"), ["--log-key", logKey, bundlePath], { stdio: "pipe" });
+  verified = true;
+} catch (e) {
+  console.log(String(e.stdout));
+}
+check(verified, `whole chain verifies offline with the pinned log key (${events.length} rows)`);
 console.log(failures ? `\nFAIL (${failures})` : "\nPASS: every MCP call produced a correct, verifiable identity-chain record");
 process.exit(failures ? 1 : 0);

@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { Sidebar } from "@/components/at/sidebar";
-import { Toaster } from "@/components/ui/sonner";
+import { Toaster } from "@/components/at/toast";
 import { api } from "@/lib/api";
 import type { Tenant } from "@/lib/types";
 import "./globals.css";
@@ -21,7 +21,7 @@ export default async function RootLayout({ children }: LayoutProps<"/">) {
       <body className="flex min-h-full bg-zinc-50 font-sans text-foreground dark:bg-background">
         <Sidebar tenants={[...tenants].reverse().map((t) => ({ id: t.id, name: t.name, legal_hold: t.legal_hold }))} />
         <main className="min-w-0 flex-1">{children}</main>
-        <Toaster richColors position="bottom-right" />
+        <Toaster />
       </body>
     </html>
   );

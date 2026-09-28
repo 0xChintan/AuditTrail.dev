@@ -7,7 +7,7 @@ import { API_URL } from "@/lib/api";
  * exposed here; mutations go through server actions.
  */
 const ALLOWED = [/^v1\/events(\/[0-9a-f-]+(\/proof)?)?$/, /^v1\/checkpoints(\/[0-9a-f-]+)?$/, /^v1\/export$/, /^v1\/verify$/,
-  /^v1\/stats$/, /^v1\/chain\/head$/, /^v1\/templates$/, /^v1\/purges$/, /^v1\/tenants\/[0-9a-f-]+\/public-keys$/];
+  /^v1\/stats$/, /^v1\/chain\/head$/, /^v2\/export$/, /^v2\/tree-heads$/, /^v2\/tenants\/[0-9a-f-]+\/log$/, /^v1\/templates$/, /^v1\/purges$/, /^v1\/tenants\/[0-9a-f-]+\/public-keys$/];
 
 export async function GET(req: NextRequest, ctx: RouteContext<"/api/at/[...path]">) {
   const { path } = await ctx.params;

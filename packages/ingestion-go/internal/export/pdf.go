@@ -161,8 +161,18 @@ func deref(p *string, def string) string {
 	return *p
 }
 
+// TreeHeadInfo summarizes a signed, witnessed tree head for the report.
+type TreeHeadInfo struct {
+	TreeSize  int64
+	RootHash  string
+	Witnesses []string
+	TSA       string
+	CreatedAt string
+	Note      string
+}
+
 // WritePDF renders the human-readable compliance evidence report (Task 6.2).
-func WritePDF(w io.Writer, b verify.Bundle, t Template, rep verify.Report) error {
+func WritePDF(w io.Writer, b verify.Bundle, t Template, rep verify.Report, heads ...TreeHeadInfo) error {
 	f := fpdf.New("L", "mm", "A4", "")
 	p := &pdfDoc{Fpdf: f, tr: f.UnicodeTranslatorFromDescriptor("")}
 	p.SetMargins(12, 12, 12)
@@ -186,6 +196,11 @@ func WritePDF(w io.Writer, b verify.Bundle, t Template, rep verify.Report) error
 	p.SetTextColor(0, 0, 0)
 	p.h1(t.Title)
 	p.para(t.Source + ". " + t.Summary)
+	if t.Applicability != "" {
+		p.SetTextColor(120, 80, 0)
+		p.para(t.Applicability)
+		p.SetTextColor(0, 0, 0)
+	}
 
 	first, last := "-", "-"
 	if n := len(b.Events); n > 0 {
@@ -305,6 +320,17 @@ func WritePDF(w io.Writer, b verify.Bundle, t Template, rep verify.Report) error
 		if cp.ExternalAnchorProof != nil {
 			p.kv("TimeStampToken (base64, excerpt)", trunc(*cp.ExternalAnchorProof, 300))
 		}
+	}
+
+	if len(heads) > 0 {
+		p.h2("Signed tree heads and independent witnesses (C2SP checkpoints)")
+		p.para("Each tree head commits to every record up to its size (RFC 9162 Merkle root) and is signed by the tenant log key. Independent witnesses cosign a head only if it is an append-only extension of the last one they saw, so two different histories cannot both be witnessed.")
+		var hrows [][]string
+		for _, h := range heads {
+			hrows = append(hrows, []string{fmt.Sprint(h.TreeSize), trunc(h.RootHash, 40), strings.Join(h.Witnesses, ", "), h.TSA, h.CreatedAt})
+		}
+		p.table([]float64{22, 70, 95, 50, 36}, []string{"Tree size", "Root hash", "Witness cosignatures", "RFC 3161 anchor", "Signed at"}, hrows, 7, nil)
+		p.kv("Latest checkpoint note", heads[0].Note)
 	}
 
 	// ---- event log --------------------------------------------------------------------

@@ -12,6 +12,7 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { verifyBundleWasm, type WasmReport } from "@/lib/wasm-verifier";
 
 type Check = { label: string; ok: boolean | null; detail?: string };
 
@@ -156,16 +157,28 @@ function ProofVerifier() {
 
 function BundleVerifier() {
   const [report, setReport] = useState<BundleReport | null>(null);
+  const [v2rep, setV2rep] = useState<WasmReport | null>(null);
   const [name, setName] = useState("");
   const [progress, setProgress] = useState<[number, number] | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [logKeys, setLogKeys] = useState("");
+  const [witnesses, setWitnesses] = useState("");
+  const [quorum, setQuorum] = useState(0);
+  const lines = (t: string) => t.split("\n").map((l) => l.trim()).filter(Boolean);
   const onFile = async (f: File) => {
     setName(f.name);
     setReport(null);
+    setV2rep(null);
     setErr(null);
     try {
-      const b = JSON.parse(await f.text()) as Bundle;
-      setReport(await verifyBundle(b, (d, t) => setProgress([d, t])));
+      const text = await f.text();
+      const b = JSON.parse(text) as Bundle | { format: string };
+      if (b.format === "audittrail.bundle.v2") {
+        setProgress([0, 1]);
+        setV2rep(await verifyBundleWasm(text, { log_keys: lines(logKeys), witnesses: lines(witnesses), quorum }));
+      } else {
+        setReport(await verifyBundle(b as Bundle, (d, t) => setProgress([d, t])));
+      }
     } catch (e) {
       setErr(String((e as Error).message ?? e));
     }
@@ -188,8 +201,30 @@ function BundleVerifier() {
         {progress && <span>Verifying {progress[0]} / {progress[1]}…</span>}
         <input type="file" accept=".json,application/json" className="hidden" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
       </label>
-      <div>
+      <div className="space-y-3">
+        <details className="rounded-lg border p-3 text-sm" open>
+          <summary className="cursor-pointer font-medium">Trust settings (v2 bundles)</summary>
+          <div className="mt-2 grid gap-2">
+            <Label className="text-xs">Pinned log key(s): vkey per line, obtained out of band. If empty, the bundle&apos;s own keys are used and the result is marked UNPINNED.</Label>
+            <Textarea className="h-16 font-mono text-[11px]" value={logKeys} onChange={(e) => setLogKeys(e.target.value)} placeholder="audittrail.dev/log/<tenant>+<id>+<key>" />
+            <Label className="text-xs">Trusted witness key(s): cosignature/v1 vkey per line</Label>
+            <Textarea className="h-16 font-mono text-[11px]" value={witnesses} onChange={(e) => setWitnesses(e.target.value)} />
+            <Label className="text-xs">Required witness cosignatures (quorum)</Label>
+            <input type="number" min={0} value={quorum} onChange={(e) => setQuorum(Number(e.target.value))} className="h-8 w-24 rounded-md border px-2 text-sm" />
+          </div>
+        </details>
         {err && <Checks checks={[{ label: err, ok: false }]} />}
+        {v2rep && (
+          <Checks
+            title={v2rep.ok ? `Verified offline: ${v2rep.events} records (seq ${v2rep.first_seq}–${v2rep.last_seq}), keys ${v2rep.trust}` : `Tampering detected${v2rep.tampered_seqs.length ? ` at seq ${v2rep.tampered_seqs.join(", ")}` : ""}`}
+            checks={[
+              ...Object.entries(v2rep.checks).sort().map(([k, c]) => ({ label: `${k}: ${c.status}`, ok: c.status === "pass" ? true : c.status === "fail" ? false : null, detail: c.status === "fail" ? c.detail : undefined })),
+              ...(v2rep.witnessed_by?.length ? [{ label: `Witnessed by ${v2rep.witnessed_by.join(", ")}`, ok: null }] : []),
+              ...(v2rep.anchored_at ? [{ label: `RFC 3161 anchor: ${v2rep.anchored_at}`, ok: true as const }] : []),
+              ...v2rep.warnings.map((w) => ({ label: `warning (${w.invariant})`, ok: null, detail: w.detail })),
+            ]}
+          />
+        )}
         {report && (
           <Checks
             title={report.ok ? `Bundle verified: ${report.eventsChecked} records, seq ${report.firstSeq}–${report.lastSeq}` : `Tampering detected at seq ${report.tamperedSeqs.join(", ")}`}

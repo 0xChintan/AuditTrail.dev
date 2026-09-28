@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { canonicalize, type DelegationFrame, type EventInput, type Outcome } from "@audittrail/core";
+import { canonicalize, type DelegationFrame } from "@audittrail/core";
+import { redactValue, type AuditEvent, type Outcome } from "@audittrail/sdk";
 import { META, envModel, first, metaString, osUser, type IdentityConfig, type Resolved } from "./identity.js";
 import { evaluate, type Policy } from "./policy.js";
 
@@ -14,7 +15,23 @@ export interface JsonRpcMessage {
 }
 
 export interface Recorder {
-  track(event: EventInput): unknown;
+  track(event: AuditEvent): unknown;
+}
+
+/** Pinned tool definitions per server: tool name -> SHA-256(JCS(definition)). */
+export interface PinStore {
+  get(server: string): Record<string, string> | undefined;
+  set(server: string, pins: Record<string, string>): void;
+}
+
+export class MemoryPinStore implements PinStore {
+  private m = new Map<string, Record<string, string>>();
+  get(server: string) {
+    return this.m.get(server);
+  }
+  set(server: string, pins: Record<string, string>) {
+    this.m.set(server, { ...pins });
+  }
 }
 
 export type CaptureMode = "full" | "redacted" | "hash" | "none";
@@ -33,6 +50,12 @@ export interface MirrorOptions {
   auditAll?: boolean;
   /** Gap with no in-flight calls that starts a new (inferred) turn. Default 2000ms. */
   turnGapMs?: number;
+  /** Tool-definition pinning (rug-pull detection). */
+  pins?: PinStore;
+  /** "warn" (default): record drift; "block": also refuse calls to drifted tools until re-approved. */
+  onDrift?: "warn" | "block";
+  /** Raw (unredacted) arguments/results: "encrypted" (default) sends them as crypto-shreddable PII; "none" keeps only hashes + redacted copies. */
+  storeRaw?: "encrypted" | "none";
   log?: (msg: string) => void;
 }
 
@@ -94,6 +117,7 @@ export class AuditMirror {
   private initMeta: Record<string, unknown> = {};
   private observedModel: string | null = null;
   private pending = new Map<string, Pending>();
+  private drifted = new Set<string>();
   private turn = 0;
   private lastActivity = 0;
   private readonly o: Required<Pick<MirrorOptions, "captureArgs" | "maxArgBytes" | "turnGapMs">> & MirrorOptions;
@@ -166,6 +190,14 @@ export class AuditMirror {
           this.client = { name: p.clientInfo?.name, version: p.clientInfo?.version };
           this.protocolVersion = p.protocolVersion ?? null;
           this.initMeta = (p._meta as Record<string, unknown>) ?? {};
+        }
+        if (msg.method === "tools/call" && this.drifted.has(String(msg.params?.name ?? "")) && this.o.onDrift === "block") {
+          const tool = String(msg.params?.name ?? "");
+          const p = this.track("client", msg);
+          const reply: JsonRpcMessage = { jsonrpc: "2.0", id: msg.id,
+            result: { content: [{ type: "text", text: `Blocked by AuditTrail: the definition of tool "${tool}" changed since it was approved. Re-approve it before use.` }], isError: true } };
+          if (p) this.finish(p, "denied", { policy: { rule: `drift:${tool}`, decision: "deny" } }, reply.result);
+          return { forward: false, reply };
         }
         if (msg.method === "tools/call" && this.o.policy) {
           const tool = String(msg.params?.name ?? "");
@@ -259,6 +291,7 @@ export class AuditMirror {
     const p = this.pending.get(`${dir}:${msg.id}`);
     if (!p) return;
     this.lastActivity = Date.now();
+    if (dir === "client" && p.method === "tools/list" && Array.isArray(msg.result?.tools)) this.checkPins(msg.result.tools);
     if (!this.audited(dir, p.method)) {
       this.pending.delete(`${dir}:${msg.id}`);
       return;
@@ -309,42 +342,90 @@ export class AuditMirror {
     chain.push({ type: kindOf(p.method), id: p.callId, method: p.method });
 
     const { action, target } = describe(p, server, this.client.name);
-    this.o.recorder.track({
-      id: randomUUID(),
-      timestamp: p.timestamp,
-      human_principal_id: principal.value,
-      agent_id: agent.value ?? "unknown",
-      model_id: model.value ?? "unknown",
-      model_version: modelVersion.value ?? "unknown",
-      delegation_chain: chain,
-      action,
-      target_resource: target,
-      outcome,
-      metadata: {
-        mcp: {
-          method: p.method,
-          jsonrpc_id: p.id,
-          direction: p.dir === "client" ? "agent_to_server" : "server_to_agent",
-          session_id: this.sessionId,
-          mcp_session_id: this.mcpSessionId,
-          protocol_version: this.protocolVersion,
-          transport: this.o.transport,
-          server: { name: server, version: this.server.version ?? null, upstream: this.o.upstream },
-          client: { name: this.client.name ?? null, version: this.client.version ?? null },
-        },
-        ...this.captureParams(p),
-        result: summarizeResult(result),
-        latency_ms: Date.now() - p.started,
-        concurrent_calls: p.concurrent,
-        identity_provenance: {
-          human_principal_id: principal.source,
-          agent_id: agent.source,
-          model_id: model.source,
-          model_version: modelVersion.source,
-        },
-        ...extra,
+    const payload = {
+      mcp: {
+        method: p.method,
+        jsonrpc_id: p.id,
+        direction: p.dir === "client" ? "agent_to_server" : "server_to_agent",
+        session_id: this.sessionId,
+        mcp_session_id: this.mcpSessionId,
+        protocol_version: this.protocolVersion,
+        transport: this.o.transport,
+        server: { name: server, version: this.server.version ?? null, upstream: this.o.upstream },
+        client: { name: this.client.name ?? null, version: this.client.version ?? null },
       },
+      ...this.captureParams(p),
+      result: summarizeResult(result),
+      latency_ms: Date.now() - p.started,
+      concurrent_calls: p.concurrent,
+      identity_provenance: {
+        human_principal_id: principal.source,
+        agent_id: agent.source,
+        model_id: model.source,
+        model_version: modelVersion.source,
+      },
+      ...extra,
+    };
+    const scannedResult = scanResult(result);
+    if (scannedResult.found) (payload as Record<string, unknown>).result_secrets_found = scannedResult.found;
+    let piiRaw: AuditEvent["pii"] = null;
+    if ((this.o.storeRaw ?? "encrypted") === "encrypted" && (p.method === "tools/call" || p.method === "resources/read" || p.method === "prompts/get")) {
+      const clip = (x: unknown) => {
+        const t = JSON.stringify(x ?? null) ?? "null";
+        return t.length > 60000 ? t.slice(0, 60000) + "…[truncated]" : t;
+      };
+      const { _meta, ...params } = p.params;
+      piiRaw = { subject: principal.value ?? `mcp-session:${this.sessionId}`, fields: { arguments: clip(params), result: clip(result ?? null) } };
+    }
+    this.o.recorder.track({
+      pii: piiRaw,
+      occurredAt: p.timestamp,
+      principal: principal.value ? { id: principal.value, type: "human" } : null,
+      agent: { id: agent.value ?? "unknown" },
+      model: { id: model.value ?? "unknown", version: modelVersion.value ?? null },
+      delegation: chain.map(scalarFrame),
+      action,
+      resource: target,
+      outcome,
+      payload: jsonSafe(payload) as Record<string, unknown>,
     });
+  }
+
+  /** Rug-pull detection: hash each tool definition and compare with pins. */
+  private checkPins(tools: any[]): void {
+    const store = this.o.pins;
+    if (!store) return;
+    const server = this.serverName;
+    const current: Record<string, string> = {};
+    for (const t of tools) if (t && typeof t.name === "string") current[t.name] = sha256Canon(t);
+    const pinned = store.get(server);
+    const emit = (action: string, tool: string, outcome: Outcome, extra: Record<string, unknown>) =>
+      this.o.recorder.track({
+        principal: null,
+        agent: { id: "audittrail-mcp-proxy" },
+        action,
+        resource: `mcp://${encodeURIComponent(server)}/tools/${tool}`,
+        outcome,
+        payload: { tool, server, session_id: this.sessionId, ...extra },
+      });
+    if (!pinned) {
+      store.set(server, current);
+      for (const [tool, hash] of Object.entries(current)) emit("mcp.tool/pinned", tool, "allowed", { definition_sha256: hash });
+      return;
+    }
+    const drift = this.o.onDrift === "block" ? "denied" : "error";
+    for (const [tool, hash] of Object.entries(current)) {
+      if (!(tool in pinned)) {
+        emit("mcp.tool/added", tool, drift, { definition_sha256: hash, note: "tool appeared after the server's tools were pinned" });
+        this.drifted.add(tool);
+      } else if (pinned[tool] !== hash) {
+        emit("mcp.tool/definition_changed", tool, drift, { pinned_sha256: pinned[tool], current_sha256: hash, action_taken: this.o.onDrift === "block" ? "calls blocked until re-approved" : "recorded" });
+        this.drifted.add(tool);
+      }
+    }
+    for (const tool of Object.keys(pinned)) {
+      if (!(tool in current)) emit("mcp.tool/removed", tool, "error", { pinned_sha256: pinned[tool] });
+    }
   }
 
   private captureParams(p: Pending): Record<string, unknown> {
@@ -357,7 +438,12 @@ export class AuditMirror {
     out.arguments_sha256 = sha256Canon(args ?? null);
     const mode = this.o.captureArgs;
     if (mode === "full" || mode === "redacted") {
-      const v = mode === "full" ? args : redact(args);
+      let v = mode === "full" ? args : redact(args);
+      if (mode === "redacted") {
+        const rep = { redacted: 0, kinds: new Set<string>() };
+        v = redactValue(v, {}, rep);
+        if (rep.redacted) out.secrets_found = { count: rep.redacted, kinds: [...rep.kinds] };
+      }
       const size = Buffer.byteLength(JSON.stringify(v ?? null));
       out.arguments = size <= this.o.maxArgBytes ? (v ?? null) : { _omitted: true, bytes: size, reason: "exceeds maxArgBytes" };
       if (mode === "redacted") out.arguments_redacted = true;
@@ -421,4 +507,37 @@ export function deriveName(upstream: string): string {
   const parts = upstream.split(/\s+/).filter((x) => !x.startsWith("-"));
   const pkg = parts.find((x) => x.includes("server")) ?? parts[parts.length - 1] ?? "mcp-server";
   return pkg.replace(/^@[^/]+\//, "").replace(/@[\d.]+$/, "") || "mcp-server";
+}
+
+/** Delegation frames must carry only scalar values (SPEC §1). */
+function scalarFrame(f: DelegationFrame): { type: string; id: string; [k: string]: string | number | boolean | null } {
+  const out: { type: string; id: string; [k: string]: string | number | boolean | null } = { type: String(f.type).slice(0, 64) || "frame", id: String(f.id).slice(0, 512) || "unknown" };
+  for (const [k, v] of Object.entries(f)) {
+    if (k === "type" || k === "id") continue;
+    if (v === null || typeof v === "string" || typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v))) out[k] = v as string | number | boolean | null;
+  }
+  return out;
+}
+
+/** Tool data is arbitrary: make it safe for the strict contract (big numbers -> strings, NUL stripped). */
+export function jsonSafe(v: unknown, depth = 0): unknown {
+  if (depth > 12) return "[depth limit]";
+  if (typeof v === "number") return Number.isFinite(v) && Math.abs(v) <= 2 ** 53 ? v : String(v);
+  if (typeof v === "bigint") return v.toString();
+  if (typeof v === "string") return v.replace(/\u0000/g, "").toWellFormed();
+  if (Array.isArray(v)) return v.map((x) => jsonSafe(x, depth + 1));
+  if (v && typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v)) if (x !== undefined) out[k.replace(/\u0000/g, "").toWellFormed()] = jsonSafe(x, depth + 1);
+    return out;
+  }
+  return v;
+}
+
+/** Scan a tool result's text for credentials (the result itself is stored only as a digest + encrypted copy). */
+function scanResult(result: any): { found?: { count: number; kinds: string[] } } {
+  if (!result) return {};
+  const rep = { redacted: 0, kinds: new Set<string>() };
+  redactValue(result, {}, rep);
+  return rep.redacted ? { found: { count: rep.redacted, kinds: [...rep.kinds] } } : {};
 }

@@ -56,7 +56,7 @@ func IsUniqueViolation(err error) bool {
 }
 
 // RolePasswords configures LOGIN roles created by Migrate.
-type RolePasswords struct{ App, Worker, Purge string }
+type RolePasswords struct{ App, Worker, Purge, Control string }
 
 func quoteLiteral(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
 
@@ -123,6 +123,7 @@ func Migrate(ctx context.Context, adminDSN string, pw RolePasswords, log func(st
 		{"audittrail_app", pw.App, true},
 		{"audittrail_worker", pw.Worker, true},
 		{"audittrail_purge", pw.Purge, true},
+		{"audittrail_control", pw.Control, true},
 	}
 	for _, r := range roles {
 		var exists bool
@@ -147,7 +148,7 @@ func Migrate(ctx context.Context, adminDSN string, pw RolePasswords, log func(st
 	}
 	for _, s := range []string{
 		"GRANT CREATE, USAGE ON SCHEMA public TO audittrail_owner",
-		"GRANT CONNECT ON DATABASE " + pgx.Identifier{dbName}.Sanitize() + " TO audittrail_app, audittrail_worker, audittrail_purge",
+		"GRANT CONNECT ON DATABASE " + pgx.Identifier{dbName}.Sanitize() + " TO audittrail_app, audittrail_worker, audittrail_purge, audittrail_control",
 		"GRANT audittrail_owner TO CURRENT_USER",
 	} {
 		if _, err := conn.Exec(ctx, s); err != nil && !strings.Contains(err.Error(), "already") {
@@ -202,4 +203,15 @@ func Migrate(ctx context.Context, adminDSN string, pw RolePasswords, log func(st
 		log("applied %s", f)
 	}
 	return nil
+}
+
+// InTenant runs fn in a transaction scoped to one tenant: it sets
+// app.tenant_id (SET LOCAL semantics), which the RLS policies require.
+func InTenant(ctx context.Context, pool *pgxpool.Pool, tenantID string, fn func(pgx.Tx) error) error {
+	return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tenantID); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
 }
